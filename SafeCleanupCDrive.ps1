@@ -56,6 +56,8 @@
     Clean Recent Files - Disabled by default
 .PARAMETER CleanupWindowsPatchCache
     Clean C:\Windows\Installer\$PatchCache - Disabled by default
+.PARAMETER CleanupIISLogs
+    Compresses IIS Logs >30 days old to an Archive subfolder and deletes archived >60 days old - Disabled by default
 
 .NOTES
     Run as Administrator.
@@ -65,7 +67,7 @@
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [Parameter()]
-    [string]$LogFilePath = (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
+    [string]$LogFilePath, #= (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
     [Parameter()]
     [switch]$CleanupWindowsTemp,
     [Parameter()]
@@ -87,9 +89,12 @@ param(
     [Parameter()]
     [switch]$CleanupRecentFiles,
     [Parameter()]
-    [switch]$CleanupWindowsPatchCache
+    [switch]$CleanupWindowsPatchCache,
+    [Parameter()]
+    [switch]$CleanupIISLogs
 )
 
+# --- DEFAULT PARAMETER HANDLING ---
 # --- Set default options if not specified ---
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsTemp'))      { $CleanupWindowsTemp      = $true }
 if (-not $PSBoundParameters.ContainsKey('CleanupCTemp'))            { $CleanupCTemp            = $true }
@@ -102,13 +107,18 @@ if (-not $PSBoundParameters.ContainsKey('CleanupShadowCopies'))     { $CleanupSh
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPrefetch'))  { $CleanupWindowsPrefetch  = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupRecentFiles'))      { $CleanupRecentFiles      = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPatchCache')){ $CleanupWindowsPatchCache= $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupIISLogs'))          { $CleanupIISLogs          = $false }
 
-# --- Initialize script variables ---
+# GLOBAL VARIABLES AND CONFIG
+# --- Initialise script variables ---
 $scriptStartTime = Get-Date
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+#$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = "C:\Users\cmccorrin\Downloads"
 $startDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not $script:StepSizes) { $script:StepSizes = @{} }
 
-# --- Initialize logging ---
+
+# --- Initialise logging ---
 if ($LogFilePath) {
     # Check if the provided path is a directory or a file
     if (Test-Path $LogFilePath -PathType Container) {
@@ -131,138 +141,6 @@ if (-not (Test-Path $parentDir)) {
 # Write initial log entry with start time
 Set-Content -Path $LogFile -Value "SafeCleanupCDrive started: $(Get-Date)`n" -WhatIf:$false
 
-# --- Logging function: writes messages to log file and optionally to console ---
-function Write-Log {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-        [Parameter()]
-        [switch]$LogOnly,
-        [Parameter()]
-        [System.ConsoleColor]$Colour
-    )
-
-    # Ensure log file exists
-    if (-not (Test-Path -Path $LogFile)) {
-        New-Item -Path $LogFile -ItemType File -Force -WhatIf:$false | Out-Null
-    }
-    # Write message to log file
-    Add-Content -Path $LogFile -Value $Message -WhatIf:$false
-    # Optionally write to console, with colour if specified
-    if (-not $LogOnly) {
-        if ($PSBoundParameters.ContainsKey('Colour') -and $Colour) {
-            Write-Host $Message -ForegroundColor $Colour
-        } else {
-            Write-Host $Message
-        }
-    }
-}
-
-# --- Logs detailed error information to the log file and optionally to the console ---
-function Write-ErrorLog {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Operation,
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-        [Parameter()]
-        [System.Management.Automation.ErrorRecord]$ErrorRecord,
-        [Parameter()]
-        [ValidateSet('Critical', 'Warning', 'Information')]
-        [string]$Severity = 'Warning',
-        [Parameter()]
-        [switch]$Critical
-    )
-
-    # Build error details object for logging
-    $errorDetails = @{
-        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Operation = $Operation
-        Message = $Message
-        Severity = $Severity
-        Error = $ErrorRecord.Exception.Message
-        Category = $ErrorRecord.CategoryInfo.Category
-        TargetObject = $ErrorRecord.TargetObject
-        ScriptStackTrace = $ErrorRecord.ScriptStackTrace
-    }
-    $logMessage = "[$Severity] $Operation - $Message"
-    Write-Log $logMessage -LogOnly
-    Write-Log ("[ERROR DETAILS] " + ($errorDetails | ConvertTo-Json -Compress)) -LogOnly
-    # If critical, also write to console in red
-    if ($Critical -or $Severity -eq 'Critical') {
-        Write-Host "CRITICAL ERROR: $Operation - $Message" -ForegroundColor Red
-    }
-}
-
-# --- Utility Functions ---
-# --- Converts a byte value to a human-readable size (e.g. GB) ---
-function Convert-Size {
-    param(
-        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
-        [ValidateNotNull()]
-        [double]$Bytes,
-        [Parameter()]
-        [ValidateSet('Bytes', 'KB', 'MB', 'GB', 'TB')]
-        [string]$To = 'GB',
-        [Parameter()]
-        [ValidateRange(0, 15)]
-        [int]$DecimalPlaces = 3
-    )
-    process {
-        $sizes = @{
-            Bytes = 1
-            KB = 1KB
-            MB = 1MB
-            GB = 1GB
-            TB = 1TB
-        }
-        return [math]::Round($Bytes / $sizes[$To], $DecimalPlaces)
-    }
-}
-
-# --- Data Structures ---
-#--- Represents the result of a file or directory removal operation ---
-class RemovalResult {
-    [string]$Path
-    [bool]$Success
-    [string]$Error
-    [long]$BytesAttempted
-    RemovalResult([string]$path, [bool]$success, [string]$errorMsg, [long]$bytes) {
-        $this.Path = $path
-        $this.Success = $success
-        $this.Error = $errorMsg
-        $this.BytesAttempted = $bytes
-    }
-}
-
-# --- Initialize global script variables ---
-if (-not $script:SuccessList) { $script:SuccessList = @() }
-if (-not $script:FailList) { $script:FailList = @() }
-if (-not $script:StepSizes) { $script:StepSizes = @{} }
-
-# --- User Filtering ---
-$SystemAccounts = @('Default', 'Default User', 'Public', 'All Users', 'Administrator')
-$UserAccountExcludePatterns = @(
-    '^S_', '^svc', '^admin$', '^administrator$', '^admin\d+$', '^adm$', '^adm\d+$', '^sys', '^test$', '^test\d+$'
-)
-
-# --- Checks if a user profile should be excluded from clean-up based on name patterns or system accounts ---
-function Test-ExcludedUserProfile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$userName
-    )
-    return ($userName -in $SystemAccounts) -or ($UserAccountExcludePatterns | Where-Object { $_ -and $userName -match $_ })
-}
-
-# --- Gets all non-system user profiles on the system ---
-function Get-NonSystemUserProfiles {
-    Get-ChildItem 'C:\Users' -Directory | Where-Object {
-        -not (Test-ExcludedUserProfile $_.Name)
-    }
-}
-
-# --- Cleanup Configuration ---
 # Define the configuration for each clean-up step
 $CleanupConfig = @{
     WindowsTemp = @{
@@ -319,8 +197,163 @@ $CleanupConfig = @{
         Paths = @("C:\Windows\Installer\$PatchCache$\*")
         Description = "Clean C:\Windows\Installer\$PatchCache$"
     }
+    IISLogs = @{
+        LogFolder = "C:\inetpub\logs\LogFiles"
+        ArchiveFolderName = "Archive"
+        RetentionDays = 30
+        ArchiveDeletionDays = 60
+        Description = "Compress IIS Logs >30 days old to an Archive subfolder and delete archived >60 days old"
+    }
+
 }
 
+# --- DATA STRUCTURES ---
+#--- Represents the result of a file or directory removal operation ---
+class RemovalResult {
+    [string]$Path
+    [bool]$Success
+    [string]$Error
+    [long]$BytesAttempted
+    RemovalResult([string]$path, [bool]$success, [string]$errorMsg, [long]$bytes) {
+        $this.Path = $path
+        $this.Success = $success
+        $this.Error = $errorMsg
+        $this.BytesAttempted = $bytes
+    }
+}
+
+# --- UTILITY FUNCTIONS ---
+# --- Logging function: writes messages to log file and optionally to console ---
+function Write-Log {
+    param(
+        [Parameter()]
+        [string]$Message,
+        [Parameter()]
+        [switch]$LogOnly,
+        [Parameter()]
+        [System.ConsoleColor]$Colour
+    )
+
+    # Ensure log file exists
+    if (-not (Test-Path -Path $LogFile)) {
+        New-Item -Path $LogFile -ItemType File -Force -WhatIf:$false | Out-Null
+    }
+    # Write message to log file
+    Add-Content -Path $LogFile -Value $Message -WhatIf:$false
+    # Optionally write to console, with colour if specified
+    if (-not $LogOnly) {
+        if ($PSBoundParameters.ContainsKey('Colour') -and $Colour) {
+            Write-Host $Message -ForegroundColor $Colour
+        } else {
+            Write-Host $Message
+        }
+    }
+}
+
+# --- Logs detailed error information to the log file and optionally to the console ---
+function Write-ErrorLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Operation,
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [Parameter()]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter()]
+        [ValidateSet('Critical', 'Warning', 'Information')]
+        [string]$Severity = 'Warning',
+        [Parameter()]
+        [switch]$Critical
+    )
+
+    # Default message if empty
+    if (-not $Message) { $Message = "Unknown error" }
+
+    # Build error details object for logging
+    $errorDetails = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Operation = $Operation
+        Message = $Message
+        Severity = $Severity
+        Error = if ($ErrorRecord) { $ErrorRecord.Exception.Message } else { $null }
+        Category = if ($ErrorRecord) { $ErrorRecord.CategoryInfo.Category } else { $null }
+        TargetObject = if ($ErrorRecord) { $ErrorRecord.TargetObject } else { $null }
+        ScriptStackTrace = if ($ErrorRecord) { $ErrorRecord.ScriptStackTrace } else { $null }
+    }
+    $logMessage = "[$Severity] $Operation - $Message"
+    Write-Log $logMessage -LogOnly
+    Write-Log ("[ERROR DETAILS] " + ($errorDetails | ConvertTo-Json -Compress)) -LogOnly
+    # If critical, also write to console in red
+    if ($Critical -or $Severity -eq 'Critical') {
+        Write-Host "CRITICAL ERROR: $Operation - $Message" -ForegroundColor Red
+    }
+}
+
+# --- Converts a byte value to a human-readable size (e.g. GB) ---
+function Convert-Size {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [ValidateNotNull()]
+        [double]$Bytes,
+        [Parameter()]
+        [ValidateSet('Bytes', 'KB', 'MB', 'GB', 'TB')]
+        [string]$To = 'GB',
+        [Parameter()]
+        [ValidateRange(0, 15)]
+        [int]$DecimalPlaces = 3
+    )
+    process {
+        $sizes = @{
+            Bytes = 1
+            KB = 1KB
+            MB = 1MB
+            GB = 1GB
+            TB = 1TB
+        }
+        return [math]::Round($Bytes / $sizes[$To], $DecimalPlaces)
+    }
+}
+
+# --- User Filtering ---
+$SystemAccounts = @('Default', 'Default User', 'Public', 'All Users', 'Administrator')
+$UserAccountExcludePatterns = @(
+    '^S_', '^svc', '^admin$', '^administrator$', '^admin\d+$', '^adm$', '^adm\d+$', '^sys', '^test$', '^test\d+$'
+)
+
+# --- Checks if a user profile should be excluded from clean-up based on name patterns or system accounts ---
+function Test-ExcludedUserProfile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$userName
+    )
+    return ($userName -in $SystemAccounts) -or ($UserAccountExcludePatterns | Where-Object { $_ -and $userName -match $_ })
+}
+
+# --- Gets all non-system user profiles on the system ---
+function Get-NonSystemUserProfiles {
+    Get-ChildItem 'C:\Users' -Directory | Where-Object {
+        -not (Test-ExcludedUserProfile $_.Name)
+    }
+}
+
+# --- Checks if a given path exists and is safe to clean (handles wildcards) ---
+function Test-SafePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    
+    $hasWildcard = $Path.Contains('*')
+    # Check if the path contains wildcards
+    $basePath = if ($hasWildcard) { Split-Path $Path -Parent } else { $Path }
+    # Normalize the base path to ensure it exists
+    if (-not (Test-Path $basePath)) {
+        return @{ IsValid = $false; Error = "Path not found: $basePath"; BasePath = $basePath }
+    }
+    return @{ IsValid = $true; Error = $null; BasePath = $basePath; HasWildcard = $hasWildcard }
+}
+
+# --- CORE CLEANUP FUNCTIONS ---
 # --- Starts or stops a Windows service and waits for the operation to complete ---
 function Set-ServiceState {
     [CmdletBinding(SupportsShouldProcess)]
@@ -372,24 +405,7 @@ function Set-ServiceState {
     }
 }
 
-# --- Checks if a given path exists and is safe to clean (handles wildcards) ---
-function Test-SafePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-    
-    $hasWildcard = $Path.Contains('*')
-    # Check if the path contains wildcards
-    $basePath = if ($hasWildcard) { Split-Path $Path -Parent } else { $Path }
-    # Normalize the base path to ensure it exists
-    if (-not (Test-Path $basePath)) {
-        return @{ IsValid = $false; Error = "Path not found: $basePath"; BasePath = $basePath }
-    }
-    return @{ IsValid = $true; Error = $null; BasePath = $basePath; HasWildcard = $hasWildcard }
-}
-
-# --- Removes files and directories safely, with size tracking and error handling ---
+<# --- Removes files and directories safely, with size tracking and error handling ---
 function Remove-Safe {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -430,7 +446,9 @@ function Remove-Safe {
             # 1. Delete all files inside the directory (recursively)
             try {
                 # Use long path prefix to avoid Windows path length issues
-                $longPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
+                $useLongPath = ($item.FullName.Length -gt 260)
+                $longFilePath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
+                #$longPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
                 $allFiles = Get-ChildItem -Path $longPath -File -Recurse -Force -ErrorAction SilentlyContinue
             } catch {
                 Write-ErrorLog -Operation "Get-ChildItem" -Message "Failed to enumerate files under $($item.FullName)" -ErrorRecord $_
@@ -440,7 +458,9 @@ function Remove-Safe {
                 $fileSize = $file.Length
                 $bytesBefore += $fileSize
                 # Use long path prefix to avoid Windows path length issues
-                $longFilePath = if ($file.FullName -notlike '\\?\*') { '\\?\'+$file.FullName } else { $file.FullName }
+                $useLongPath = ($file.FullName.Length -gt 260)
+                $longFilePath = if ($useLongPath -and $file.FullName -notlike '\\?\*') { '\\?\'+$file.FullName } else { $file.FullName }
+                #$longFilePath = if ($file.FullName -notlike '\\?\*') { '\\?\'+$file.FullName } else { $file.FullName }
                 # Use ShouldProcess for WhatIf support
                 if ($PSCmdlet.ShouldProcess($file.FullName, "Remove file")) {
                     try {
@@ -469,7 +489,9 @@ function Remove-Safe {
             # Sort directories by FullName descending to ensure deepest directories are processed first
             $dirs | Sort-Object -Property FullName -Descending | ForEach-Object {
                 # Use long path prefix to avoid Windows path length issues
-                $longDirPath = if ($_.FullName -notlike '\\?\*') { '\\?\'+$_.FullName } else { $_.FullName }
+                $useLongPath = ($_.FullName.Length -gt 260)
+                $longDirPath = if ($useLongPath -and $_.FullName -notlike '\\?\*') { '\\?\'+$_.FullName } else { $_.FullName }
+                #$longDirPath = if ($_.FullName -notlike '\\?\*') { '\\?\'+$_.FullName } else { $_.FullName }
                 if ($PSCmdlet.ShouldProcess($_.FullName, "Remove directory")) {
                     try {
                         # Attempt to delete the directory (with -Recurse in case of hidden children)
@@ -488,7 +510,9 @@ function Remove-Safe {
             }
             # 3. Finally, attempt to remove the top-level directory itself
             # Use long path prefix to avoid Windows path length issues
-            $longTopDirPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
+            $useLongPath = ($item.FullName.Length -gt 260)
+            $longTopDirPath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
+            #$longTopDirPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
             if ($PSCmdlet.ShouldProcess($item.FullName, "Remove directory")) {
                 try {
                     # Attempt to delete the top-level directory
@@ -508,7 +532,8 @@ function Remove-Safe {
             $fileSize = $item.Length
             $bytesBefore += $fileSize
             # Use long path prefix to avoid Windows path length issues
-            $longFilePath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
+            $useLongPath = ($item.FullName.Length -gt 260)
+            $longFilePath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
             if ($PSCmdlet.ShouldProcess($item.FullName, "Remove file")) {
                 try {
                     # Attempt to delete the file
@@ -552,6 +577,188 @@ function Add-StepResult {
         Before = $BytesBefore
         Deleted = $BytesDeleted
     }
+}#>
+
+function Remove-Safe {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $results = [System.Collections.ArrayList]::new()
+    $bytesBefore = 0
+    $bytesDeleted = 0
+
+    # Use Get-ChildItem for wildcards, Get-Item otherwise
+    $hasWildcard = $Path.Contains('*')
+    if ($hasWildcard) {
+        $items = @(Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue)
+    } else {
+        $items = @(Get-Item -Path $Path -Force -ErrorAction SilentlyContinue)
+    }
+
+    if (-not $items) {
+        return [PSCustomObject]@{
+            Results = $results
+            BytesBefore = 0
+            BytesDeleted = 0
+        }
+    }
+
+    foreach ($item in $items) {
+        if ($item.PSIsContainer) {
+            # Directory: get all files and subdirs recursively
+            $allFiles = @(Get-ChildItem -Path $item.FullName -File -Recurse -Force -ErrorAction SilentlyContinue)
+            $allDirs  = @(Get-ChildItem -Path $item.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue)
+            # Delete files first
+            foreach ($file in $allFiles) {
+                $fileSize = $file.Length
+                $bytesBefore += $fileSize
+                if ($PSCmdlet.ShouldProcess($file.FullName, "Remove file")) {
+                    try {
+                        Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                        $bytesDeleted += $fileSize
+                        $null = $results.Add([RemovalResult]::new($file.FullName, $true, $null, $fileSize))
+                    } catch {
+                        $null = $results.Add([RemovalResult]::new($file.FullName, $false, $_.Exception.Message, $fileSize))
+                    }
+                } else {
+                    $msg = "[WhatIf] Would delete file: $($file.FullName)"
+                    $null = $results.Add([RemovalResult]::new($file.FullName, $true, $msg, $fileSize))
+                }
+            }
+            # Delete directories (deepest first)
+            $allDirs = $allDirs | Sort-Object -Property FullName -Descending
+            foreach ($dir in $allDirs) {
+                if ($PSCmdlet.ShouldProcess($dir.FullName, "Remove directory")) {
+                    try {
+                        Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+                        $null = $results.Add([RemovalResult]::new($dir.FullName, $true, $null, 0))
+                    } catch {
+                        $null = $results.Add([RemovalResult]::new($dir.FullName, $false, $_.Exception.Message, 0))
+                    }
+                } else {
+                    $msg = "[WhatIf] Would remove directory: $($dir.FullName)"
+                    $null = $results.Add([RemovalResult]::new($dir.FullName, $true, $msg, 0))
+                }
+            }
+            # Finally, delete the top-level directory
+            if ($PSCmdlet.ShouldProcess($item.FullName, "Remove directory")) {
+                try {
+                    Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction Stop
+                    $null = $results.Add([RemovalResult]::new($item.FullName, $true, $null, 0))
+                } catch {
+                    $null = $results.Add([RemovalResult]::new($item.FullName, $false, $_.Exception.Message, 0))
+                }
+            } else {
+                $msg = "[WhatIf] Would remove directory: $($item.FullName)"
+                $null = $results.Add([RemovalResult]::new($item.FullName, $true, $msg, 0))
+            }
+        } else {
+            # Single file
+            $fileSize = $item.Length
+            $bytesBefore += $fileSize
+            if ($PSCmdlet.ShouldProcess($item.FullName, "Remove file")) {
+                try {
+                    Remove-Item -Path $item.FullName -Force -ErrorAction Stop
+                    $bytesDeleted += $fileSize
+                    $null = $results.Add([RemovalResult]::new($item.FullName, $true, $null, $fileSize))
+                } catch {
+                    $null = $results.Add([RemovalResult]::new($item.FullName, $false, $_.Exception.Message, $fileSize))
+                }
+            } else {
+                $msg = "[WhatIf] Would delete file: $($item.FullName)"
+                $null = $results.Add([RemovalResult]::new($item.FullName, $true, $msg, $fileSize))
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Results = $results
+        BytesBefore = $bytesBefore
+        BytesDeleted = $bytesDeleted
+    }
+}
+
+# --- SPECIAL HANDLERS ---
+# --- Archives and cleans IIS log files older than 30 days, moving them to an Archive folder ---
+function Invoke-IISLogsCleanup {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $config = $CleanupConfig.IISLogs
+    $IISLogRoot = $config.LogFolder
+    $ArchiveFolderName = "Archive"
+    $retentionDays = $config.RetentionDays
+    $archiveDeletionDays = $config.ArchiveDeletionDays
+    $now = Get-Date
+    $bytesBefore = 0
+    $bytesDeleted = 0
+
+    if (-not (Test-Path $IISLogRoot)) {
+        Write-Log "IIS log folder not found: $IISLogRoot"
+        Add-StepResult -StepName "IIS Logs" -BytesBefore 0 -BytesDeleted 0
+        return
+    }
+
+    $logFolders = Get-ChildItem $IISLogRoot -Directory -ErrorAction SilentlyContinue
+    foreach ($folder in $logFolders) {
+        $archivePath = Join-Path $folder.FullName $ArchiveFolderName
+        if (-not (Test-Path $archivePath)) {
+            New-Item -ItemType Directory -Path $archivePath -Force | Out-Null
+        }
+
+        # Find logs older than retention period to archive
+        $logsToArchive = Get-ChildItem $folder.FullName -File -Exclude $ArchiveFolderName -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $now.AddDays(-$retentionDays) }
+        # Find archives older than archive deletion period to delete
+        $archivesToDelete = Get-ChildItem $archivePath -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $now.AddDays(-$archiveDeletionDays) }
+
+        # Calculate "before" as total size of all files that would be deleted (originals + archives)
+        $bytesBefore += ($logsToArchive | Measure-Object -Property Length -Sum).Sum
+        $bytesBefore += ($archivesToDelete | Measure-Object -Property Length -Sum).Sum
+
+        # Archive logs > retention days (move to archive)
+        foreach ($log in $logsToArchive) {
+            $dest = Join-Path $archivePath $log.Name
+            if ($PSCmdlet.ShouldProcess($log.FullName, "Archive IIS log to $dest")) {
+                Move-Item $log.FullName $dest -Force
+                Write-Log ("[Archived] {0} -> {1}" -f $log.FullName, $dest) -LogOnly
+            } else {
+                Write-Log ("[WhatIf] Would archive {0} -> {1}" -f $log.FullName, $dest) -LogOnly
+            }
+        }
+
+        # Delete archives > archive deletion days
+        foreach ($archive in $archivesToDelete) {
+            if ($PSCmdlet.ShouldProcess($archive.FullName, "Delete archived IIS log")) {
+                Remove-Item $archive.FullName -Force
+                Write-Log ("[Deleted Archive] {0}" -f $archive.FullName) -LogOnly
+                $bytesDeleted += $archive.Length
+            } else {
+                Write-Log ("[WhatIf] Would delete archive {0}" -f $archive.FullName) -LogOnly
+            }
+        }
+
+        # After archiving, delete any remaining logs > retention days in the original folder (should be none, but just in case)
+        $logsToDelete = Get-ChildItem $folder.FullName -File -Exclude $ArchiveFolderName -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $now.AddDays(-$retentionDays) }
+        foreach ($log in $logsToDelete) {
+            if ($PSCmdlet.ShouldProcess($log.FullName, "Delete original IIS log")) {
+                Remove-Item $log.FullName -Force
+                Write-Log ("[Deleted Original] {0}" -f $log.FullName) -LogOnly
+                $bytesDeleted += $log.Length
+            } else {
+                Write-Log ("[WhatIf] Would delete original {0}" -f $log.FullName) -LogOnly
+            }
+        }
+    }
+
+    # In WhatIf mode, report as if all eligible files would be deleted
+    if ($WhatIfPreference -or $PSCmdlet.MyInvocation.BoundParameters['WhatIf']) {
+        Add-StepResult -StepName "IIS Logs" -BytesBefore $bytesBefore -BytesDeleted $bytesBefore
+    } else {
+        Add-StepResult -StepName "IIS Logs" -BytesBefore $bytesBefore -BytesDeleted $bytesDeleted
+    }
+    Write-Log "-- FINISHED: IIS Logs cleanup --"
 }
 
 # --- Lists contents of the Recycle Bin for all users, excluding system files ---
@@ -625,7 +832,6 @@ function Clear-RecycleBin {
             $sizeAfter = ($binContents | Measure-Object -Property SizeBytes -Sum).Sum
             # Add the step result with size tracking
             Add-StepResult -StepName "Recycle Bin" -BytesBefore $sizeBefore -BytesDeleted ($sizeBefore - $sizeAfter)
-            $script:SuccessList += "Recycle Bin (C:)"
         } catch {
             # Log the error and add to failure list
             Write-ErrorLog -Operation "RecycleBin" -Message "Could not empty Recycle Bin" -ErrorRecord $_ -Severity 'Warning'
@@ -634,7 +840,6 @@ function Clear-RecycleBin {
             $sizeAfter = ($binContents | Measure-Object -Property SizeBytes -Sum).Sum
             # Add the step result with size tracking
             Add-StepResult -StepName "Recycle Bin" -BytesBefore $sizeBefore -BytesDeleted ($sizeBefore - $sizeAfter)
-            $script:FailList += "Recycle Bin (C:)"
         }
     } else {
         # WhatIf mode: log what would have been done
@@ -657,23 +862,19 @@ function Clear-ShadowCopies {
                 if ($LASTEXITCODE -eq 0) {
                     # Log the successful deletion
                     Write-Log "Old shadow copies deleted."
-                    $script:SuccessList += "Shadow Copies"
                     # Add the step result with size tracking
                     Add-StepResult -StepName "Shadow Copies" -BytesBefore 0 -BytesDeleted 0
                 } else {
                     # Log the error and add to failure list
                     Write-Log "Could not delete shadow copies. vssadmin output: $vssResult"
-                    $script:FailList += "Shadow Copies"
                 }
             } else {
                 # vssadmin command not found, log the error
                 Write-Log "vssadmin not found. Cannot delete shadow copies."
-                $script:FailList += "Shadow Copies (vssadmin not found)"
             }
         } catch {
             # Catch any exceptions and log the error
             Write-Log "Could not delete shadow copies: $_"
-            $script:FailList += "Shadow Copies"
         }
     } else {
         # WhatIf mode: log what would have been done
@@ -682,6 +883,7 @@ function Clear-ShadowCopies {
     }
 }
 
+# --- SUMMARY AND REPORTING FUNCTIONS ---
 # --- Returns the free space on C: in GB, or "Unknown" if it can't be determined ---
 function Get-FreeSpaceGB {
     param()
@@ -706,10 +908,6 @@ function Show-Summary {
         [double]$freeAfter,
         [Parameter(Mandatory = $true)]
         [string]$LogFile,
-        [Parameter(Mandatory = $true)]
-        [array]$SuccessList,
-        [Parameter(Mandatory = $true)]
-        [array]$FailList,
         [Parameter(Mandatory = $true)]
         [datetime]$scriptStartTime,
         [Parameter(Mandatory = $true)]
@@ -798,9 +996,10 @@ function Show-Summary {
     Write-Log "==============================================================="
 }
 
+# --- STEP DISPATCHER ---
 # --- Runs the clean-up for a given step, including service handling and logging ---
 function Invoke-Cleanup {
-        param(
+    param(
         [Parameter(Mandatory = $true)]
         [string]$StepName
     )
@@ -810,7 +1009,11 @@ function Invoke-Cleanup {
         $wasRunning = $false
         # Stop service if required for this step
         if ($config.ServiceName) {
-            $wasRunning = Set-ServiceState -Name $config.ServiceName -State 'Stopped'
+            $service = Get-Service -Name $config.ServiceName -ErrorAction Stop
+            If ($service.Status -eq 'Running') {
+                $wasRunning = Set-ServiceState -Name $config.ServiceName -State 'Stopped'
+            }
+            else {$wasRunning = $false}
         }
         # Use special handler if defined (e.g. for Recycle Bin or Shadow Copies)
         if ($config.SpecialHandler) {
@@ -857,13 +1060,19 @@ try {
 
     # Enabled steps
     foreach ($step in $CleanupConfig.Keys) {
-        $switchName = "Cleanup$step"
-        $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
-        $desc = $CleanupConfig[$step].Description
-        $mode = if ($IsWhatIf) {'[Will simulate]'} else {'[Will execute]'}
-        if ($enabled) {
-            Write-Log ("• {0} {1}" -f $desc, $mode) -LogOnly
-            Write-Host ("- {0} {1}" -f $desc, $mode)
+        try {
+            $switchName = "Cleanup$step"
+            $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
+            $desc = $CleanupConfig[$step].Description
+            $mode = if ($IsWhatIf) {'[Will simulate]'} else {'[Will execute]'}
+            if ($enabled) {
+                Write-Log ("• {0} {1}" -f $desc, $mode) -LogOnly
+                Write-Host ("- {0} {1}" -f $desc, $mode)
+            }
+        } catch {
+            $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
+            Write-Log "Error determining enabled state for step '$step': $msg"
+            Write-ErrorLog -Operation "PlanOutput" -Message $msg -ErrorRecord $_
         }
     }
 
@@ -871,12 +1080,18 @@ try {
     Write-Log ""
     Write-Log "Skipped:" -Colour Yellow
     foreach ($step in $CleanupConfig.Keys) {
-        $switchName = "Cleanup$step"
-        $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
-        $desc = $CleanupConfig[$step].Description
-        if (-not $enabled) {
-            Write-Log ("• {0}" -f $desc) -LogOnly
-            Write-Host ("- {0}" -f $desc) -ForegroundColor Yellow
+        try {
+            $switchName = "Cleanup$step"
+            $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
+            $desc = $CleanupConfig[$step].Description
+            if (-not $enabled) {
+                Write-Log ("• {0}" -f $desc) -LogOnly
+                Write-Host ("- {0}" -f $desc) -ForegroundColor Yellow
+            }
+        } catch {
+            $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
+            Write-Log "Error determining skipped state for step '$step': $msg"
+            Write-ErrorLog -Operation "PlanOutputSkipped" -Message $msg -ErrorRecord $_
         }
     }
     Write-Log ""
@@ -884,8 +1099,8 @@ try {
     Write-Log "Output will be logged to: $LogFile`n"
     Write-Host ""
     $timeout = 30
-    Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColour Yellow
-    Write-Host "Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColour Yellow
+    Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
+    Write-Host "Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColor Yellow
     
     # Wait for user input or timeout. Stopwatch object to track elapsed time.
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -906,24 +1121,31 @@ try {
     Write-Log ("========== {0} Safe clean-up of C: drive started: {1} ==========" -f ($(if ($IsWhatIf) {'[WhatIf]'} else {''}), (Get-Date)))
     Write-Log ""
     Start-Sleep 5
-    # --- Execute each cleanup step ---
+    # --- Execute each cleanup step with nested try/catch ---
     foreach ($step in $CleanupConfig.Keys) {
         $switchName = "Cleanup$step"
         if (Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue) {
-            Invoke-Cleanup -StepName $step
-        } 
+            try {
+                Invoke-Cleanup -StepName $step
+            } catch {
+                $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
+                Write-Log "Error in step '$step': $msg"
+                #Write-ErrorLog -Operation $step -Message $msg -ErrorRecord $_
+            }
+        }
     }
     $freeAfter = Get-FreeSpaceGB
     # --- Final Summary Section ---
     Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile `
-        -SuccessList $script:SuccessList -FailList $script:FailList `
         -ScriptStartTime $scriptStartTime -ScriptEndTime (Get-Date)
-}
-catch {
+} catch {
     Write-Log "Unexpected script error: $_"
     Write-Host "A fatal error occurred. See log for details."
-    $script:FailList += "Script-wide error"
+    $msg = if ($_.Exception.Message) { $_.Exception.Message } else { "Unknown error" }
+    Write-ErrorLog -Operation "SomeOperation" -Message $msg -ErrorRecord $_
     $scriptEndTime = Get-Date
-    Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile -SuccessList $script:SuccessList -FailList $script:FailList -ScriptStartTime $scriptStartTime -ScriptEndTime $scriptEndTime
+    $freeAfter = Get-FreeSpaceGB
+    Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile `
+        -ScriptStartTime $scriptStartTime -ScriptEndTime $scriptEndTime
     exit 3
 }
