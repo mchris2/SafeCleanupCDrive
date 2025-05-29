@@ -13,10 +13,10 @@
     2025-05-23
 
 .LASTUPDATED
-    2025-05-26
+    2025-05-30
 
 .VERSION
-    1.0
+    1.1
 
 .CHANGELOG
     2025-05-23: Initial version.
@@ -67,7 +67,7 @@
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [Parameter()]
-    [string]$LogFilePath, #= (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
+    [string]$LogFilePath = (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
     [Parameter()]
     [switch]$CleanupWindowsTemp,
     [Parameter()]
@@ -112,8 +112,7 @@ if (-not $PSBoundParameters.ContainsKey('CleanupIISLogs'))          { $CleanupII
 # GLOBAL VARIABLES AND CONFIG
 # --- Initialise script variables ---
 $scriptStartTime = Get-Date
-#$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$scriptDir = "C:\Users\cmccorrin\Downloads"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $startDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not $script:StepSizes) { $script:StepSizes = @{} }
 
@@ -404,180 +403,6 @@ function Set-ServiceState {
         return $false
     }
 }
-
-<# --- Removes files and directories safely, with size tracking and error handling ---
-function Remove-Safe {
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-    
-    # Check if the path exists and is safe to clean (handles wildcards)
-    $pathCheck = Test-SafePath -Path $Path
-    if (-not $pathCheck.IsValid) {
-        Write-Log $pathCheck.Error
-        return [PSCustomObject]@{
-            Results = @([RemovalResult]::new($Path, $false, $pathCheck.Error, 0))
-            BytesBefore = 0
-            BytesDeleted = 0
-        }
-    }
-    
-    # Initialise result tracking and size counters
-    $results = [System.Collections.ArrayList]::new()
-    $bytesBefore = 0
-    $bytesDeleted = 0
-
-    # Get all items (files and folders) matching the path
-    $items = @(Get-Item -Path $Path -Force -ErrorAction SilentlyContinue)
-    if (-not $items) {
-        # Nothing to do, return empty result
-        return [PSCustomObject]@{
-            Results = $results
-            BytesBefore = 0
-            BytesDeleted = 0
-        }
-    }
-    foreach ($item in $items) {
-        if ($item.PSIsContainer) {
-            # --- Handle directories ---
-
-            # 1. Delete all files inside the directory (recursively)
-            try {
-                # Use long path prefix to avoid Windows path length issues
-                $useLongPath = ($item.FullName.Length -gt 260)
-                $longFilePath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
-                #$longPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
-                $allFiles = Get-ChildItem -Path $longPath -File -Recurse -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-ErrorLog -Operation "Get-ChildItem" -Message "Failed to enumerate files under $($item.FullName)" -ErrorRecord $_
-                $allFiles = @()
-            }
-            foreach ($file in $allFiles) {
-                $fileSize = $file.Length
-                $bytesBefore += $fileSize
-                # Use long path prefix to avoid Windows path length issues
-                $useLongPath = ($file.FullName.Length -gt 260)
-                $longFilePath = if ($useLongPath -and $file.FullName -notlike '\\?\*') { '\\?\'+$file.FullName } else { $file.FullName }
-                #$longFilePath = if ($file.FullName -notlike '\\?\*') { '\\?\'+$file.FullName } else { $file.FullName }
-                # Use ShouldProcess for WhatIf support
-                if ($PSCmdlet.ShouldProcess($file.FullName, "Remove file")) {
-                    try {
-                        # Attempt to delete the file
-                        Remove-Item -Path $longFilePath -Force -ErrorAction Stop
-                        $bytesDeleted += $fileSize
-                        $null = $results.Add([RemovalResult]::new($file.FullName, $true, $null, $fileSize))
-                    } catch {
-                        # Log and track any failures
-                        $null = $results.Add([RemovalResult]::new($file.FullName, $false, $_.Exception.Message, $fileSize))
-                    }
-                } else {
-                    # WhatIf mode: log what would have been deleted
-                    $msg = "[WhatIf] Would delete file: $($file.FullName)"
-                    Write-Log $msg -LogOnly
-                    $null = $results.Add([RemovalResult]::new($file.FullName, $true, $msg, $fileSize))
-                }
-            }
-            # 2. Delete all subdirectories (deepest first to avoid errors)
-            try {
-                $dirs = Get-ChildItem -Path $longPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-ErrorLog -Operation "Get-ChildItem" -Message "Failed to enumerate directories under $($item.FullName)" -ErrorRecord $_
-                $dirs = @()
-            }
-            # Sort directories by FullName descending to ensure deepest directories are processed first
-            $dirs | Sort-Object -Property FullName -Descending | ForEach-Object {
-                # Use long path prefix to avoid Windows path length issues
-                $useLongPath = ($_.FullName.Length -gt 260)
-                $longDirPath = if ($useLongPath -and $_.FullName -notlike '\\?\*') { '\\?\'+$_.FullName } else { $_.FullName }
-                #$longDirPath = if ($_.FullName -notlike '\\?\*') { '\\?\'+$_.FullName } else { $_.FullName }
-                if ($PSCmdlet.ShouldProcess($_.FullName, "Remove directory")) {
-                    try {
-                        # Attempt to delete the directory (with -Recurse in case of hidden children)
-                        Remove-Item -Path $longDirPath -Recurse -Force -ErrorAction Stop
-                        $null = $results.Add([RemovalResult]::new($_.FullName, $true, $null, 0))
-                    } catch {
-                        # Log and track any failures
-                        $null = $results.Add([RemovalResult]::new($_.FullName, $false, $_.Exception.Message, 0))
-                    }
-                } else {
-                    # WhatIf mode: log what would have been deleted
-                    $msg = "[WhatIf] Would remove directory: $($_.FullName)"
-                    Write-Log $msg -LogOnly
-                    $null = $results.Add([RemovalResult]::new($_.FullName, $true, $msg, 0))
-                }
-            }
-            # 3. Finally, attempt to remove the top-level directory itself
-            # Use long path prefix to avoid Windows path length issues
-            $useLongPath = ($item.FullName.Length -gt 260)
-            $longTopDirPath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
-            #$longTopDirPath = if ($item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
-            if ($PSCmdlet.ShouldProcess($item.FullName, "Remove directory")) {
-                try {
-                    # Attempt to delete the top-level directory
-                    Remove-Item -Path $longTopDirPath -Recurse -Force -ErrorAction Stop
-                    $null = $results.Add([RemovalResult]::new($item.FullName, $true, $null, 0))
-                } catch {
-                    $null = $results.Add([RemovalResult]::new($item.FullName, $false, $_.Exception.Message, 0))
-                }
-            } else {
-                # WhatIf mode: log what would have been deleted
-                $msg = "[WhatIf] Would remove directory: $($item.FullName)"
-                Write-Log $msg -LogOnly
-                $null = $results.Add([RemovalResult]::new($item.FullName, $true, $msg, 0))
-            }
-        } else {
-            # Handle single files at the top level
-            $fileSize = $item.Length
-            $bytesBefore += $fileSize
-            # Use long path prefix to avoid Windows path length issues
-            $useLongPath = ($item.FullName.Length -gt 260)
-            $longFilePath = if ($useLongPath -and $item.FullName -notlike '\\?\*') { '\\?\'+$item.FullName } else { $item.FullName }
-            if ($PSCmdlet.ShouldProcess($item.FullName, "Remove file")) {
-                try {
-                    # Attempt to delete the file
-                    Remove-Item -Path $longFilePath -Force -ErrorAction Stop
-                    $bytesDeleted += $fileSize
-                    $null = $results.Add([RemovalResult]::new($item.FullName, $true, $null, $fileSize))
-                } catch {
-                    $null = $results.Add([RemovalResult]::new($item.FullName, $false, $_.Exception.Message, $fileSize))
-                }
-            } else {
-                # WhatIf mode: log what would have been deleted
-                $msg = "[WhatIf] Would delete file: $($item.FullName)"
-                Write-Log $msg -LogOnly
-                $null = $results.Add([RemovalResult]::new($item.FullName, $true, $msg, $fileSize))
-            }
-        }
-    }
-    # Return a custom object with all results and size tracking
-    return [PSCustomObject]@{
-        Results = $results
-        BytesBefore = $bytesBefore
-        BytesDeleted = $bytesDeleted
-    }
-}
-
-# --- Adds a step result to the summary tracking table ---
-function Add-StepResult {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$StepName,
-        [Parameter(Mandatory = $true)]
-        [double]$BytesBefore,
-        [Parameter(Mandatory = $true)]
-        [double]$BytesDeleted,
-        [Parameter()]
-        [string]$Status = "Success",
-        [Parameter()]
-        [string]$ErrorMessage
-    )
-    $script:StepSizes[$StepName] = @{
-        Before = $BytesBefore
-        Deleted = $BytesDeleted
-    }
-}#>
 
 function Remove-Safe {
     [CmdletBinding(SupportsShouldProcess)]
