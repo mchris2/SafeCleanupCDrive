@@ -13,6 +13,7 @@ Performs the following actions:
 * Clean Windows Prefetch -Disabled by default
 * Clean Recent Files - Disabled by default
 * Clean C:\Windows\Installer\$PatchCache - Disabled by default
+* Compresses IIS Logs >30 days old to an Archive subfolder and deletes archived >60 days old - Disabled by default
 
 Switches are available to enable and disable each of the actions. By defaul the first 7 are enabled. To disable use switches as follows:
 -CleanupCTemp:false
@@ -26,6 +27,7 @@ Switches are available to enable and disable each of the actions. By defaul the 
 -CleanupWindowsPrefetch
 -CleanupRecentFiles
 -CleanupWindowsPatchCache
+-CleanupIISLogs
 
 There are additional switches for:
 -LogFilePath
