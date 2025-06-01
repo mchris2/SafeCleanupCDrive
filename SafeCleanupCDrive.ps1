@@ -16,7 +16,7 @@
     2025-05-30
 
 .VERSION
-    1.1
+    1.2
 
 .CHANGELOG
     2025-05-23: Initial version.
@@ -33,6 +33,8 @@
         - Enhanced Recycle Bin and shadow copy handling and reporting.
         - Added class for structured removal results.
         - General code clean-up and uniformity improvements.
+    2025-06-02:
+        - Added Administrator check at the start of the script
 
 .PARAMETER CleanupWindowsTemp
     Clean C:\Windows\Temp
@@ -93,6 +95,23 @@ param(
     [Parameter()]
     [switch]$CleanupIISLogs
 )
+
+# --- ADMINISTRATOR CHECK ---
+# Check if the script is running with administrator privileges
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
+    Write-Host "Configure the scheduled task to run with Administrator privileges." -ForegroundColor Yellow
+    Write-Log "ERROR: Script attempted to run without Administrator privileges. Exiting."
+    
+    # 5-second timer before exit
+    Write-Host "Exiting in 5 seconds..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+    
+    exit 1
+}
 
 # --- DEFAULT PARAMETER HANDLING ---
 # --- Set default options if not specified ---
