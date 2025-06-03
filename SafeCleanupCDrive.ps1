@@ -13,10 +13,10 @@
     2025-05-23
 
 .LASTUPDATED
-    2025-05-30
+    2025-06-03
 
 .VERSION
-    1.2
+    1.2.0
 
 .CHANGELOG
     2025-05-23: Initial version.
@@ -304,6 +304,22 @@ function Write-ErrorLog {
     # If critical, also write to console in red
     if ($Critical -or $Severity -eq 'Critical') {
         Write-Host "CRITICAL ERROR: $Operation - $Message" -ForegroundColor Red
+    }
+}
+
+function Add-StepResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StepName,
+        [Parameter(Mandatory = $true)]
+        [long]$BytesBefore,
+        [Parameter(Mandatory = $true)]
+        [long]$BytesDeleted
+    )
+    if (-not $script:StepSizes) { $script:StepSizes = @{} }
+    $script:StepSizes[$StepName] = @{
+        Before = $BytesBefore
+        Deleted = $BytesDeleted
     }
 }
 
