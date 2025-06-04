@@ -148,7 +148,7 @@ $scriptStartTime = Get-Date
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
 $startDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not $script:StepSizes) { $script:StepSizes = @{} }
-
+$UserProfileRoot = "$env:SystemDrive\Users"
 
 # --- Initialise logging ---
 if ($LogFilePath) {
@@ -276,18 +276,21 @@ function Write-Log {
         [System.ConsoleColor]$Colour
     )
 
+    $timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    $logLine = "[$timestamp] $Message"
+
     # Ensure log file exists
     if (-not (Test-Path -Path $LogFile)) {
         New-Item -Path $LogFile -ItemType File -Force -WhatIf:$false | Out-Null
     }
     # Write message to log file
-    Add-Content -Path $LogFile -Value $Message -WhatIf:$false
+    Add-Content -Path $LogFile -Value $logLine -WhatIf:$false
     # Optionally write to console, with colour if specified
     if (-not $LogOnly) {
-        if ($PSBoundParameters.ContainsKey('Colour') -and $Colour) {
-            Write-Host $Message -ForegroundColor $Colour
+        if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Colour') -and $Colour) {
+            Write-Host $logLine -ForegroundColor $Colour
         } else {
-            Write-Host $Message
+            Write-Host $logLine
         }
     }
 }
@@ -415,7 +418,7 @@ function Get-UserProfileType {
 }
 
 function Get-UserProfiles {
-    $usersPath = "$env:SystemDrive\Users"
+    $usersPath = $UserProfileRoot
     $localSIDPrefix = Get-LocalMachineSIDPrefix
     $profileSIDMap = Get-ProfileSIDMap
     $profiles = Get-ChildItem $usersPath -Directory
@@ -485,8 +488,7 @@ function Get-LocalMachineSIDPrefix {
 
 function Get-ProfileSIDMap {
     $map = @{}
-    $usersPath = "$env:SystemDrive\Users"
-    $folders = Get-ChildItem $usersPath -Directory
+    $folders = Get-ChildItem $UserProfileRoot -Directory
     # Try CIM first
     try {
         $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath -like "$usersPath\*" }
@@ -881,52 +883,37 @@ function Clear-ShadowCopies {
 function Clear-OrphanedProfiles {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    $profileSIDMap = Get-ProfileSIDMap
-    $profiles = Get-ChildItem "$env:SystemDrive\Users" -Directory
-    $statusList = @()
-    $orphaned = @()
     $domainNetbios = (Get-WmiObject Win32_NTDomain | Where-Object { $_.DnsForestName } | Select-Object -First 1).DomainName
-    $localSIDPrefix = Get-LocalMachineSIDPrefix
+    $orphaned = @()
+    $statusList = @()
+
+    # Use the centralized user profile list
+    $profiles = $Global:UserProfiles | Where-Object { $_.AccountType -eq 'Domain' }
 
     foreach ($profile in $profiles) {
-        $sid = $profileSIDMap[$profile.Name]
-        $profileType = Get-UserProfileType -ProfileName $profile.Name -SID $sid -LocalSIDPrefix $localSIDPrefix
-        $status = $profileType
-        $isOrphaned = $false
-
-        if ($profileType -eq "Domain") {
-            # Extract username if folder ends with .DOMAIN
-            $adUser = $profile.Name
-            if ($domainNetbios -and $profile.Name -like "*.$domainNetbios") {
-                $adUser = $profile.Name.Substring(0, $profile.Name.Length - $domainNetbios.Length - 1)
-            }
-            $userObj = Get-LdapUser -Username $adUser
-            if (-not $userObj) {
-                $status = "Not found in AD"
-                $isOrphaned = $true
-            } elseif (($userObj.UserAccountControl -band 2) -ne 0) {
-                $status = "Disabled in AD"
-                $isOrphaned = $true
-            } else {
-                $status = "Active in AD"
-            }
-        } elseif ($profileType -eq "Unknown") {
-            $status = "No SID mapping"
-            $isOrphaned = $true
+        # Extract username if folder ends with .DOMAIN
+        $adUser = $profile.Name
+        if ($domainNetbios -and $profile.Name -like "*.$domainNetbios") {
+            $adUser = $profile.Name.Substring(0, $profile.Name.Length - $domainNetbios.Length - 1)
         }
-
+        $userObj = Get-LdapUser -Username $adUser
+        if (-not $userObj) {
+            $status = "Not found in AD"
+            $orphaned += $profile
+        } elseif (($userObj.UserAccountControl -band 2) -ne 0) {
+            $status = "Disabled in AD"
+            $orphaned += $profile
+        } else {
+            $status = "Active in AD"
+        }
         $statusList += [PSCustomObject]@{
             Profile = $profile.Name
-            Path    = $profile.FullName
+            Path    = $profile.Path
             Status  = $status
-        }
-
-        if ($isOrphaned) {
-            $orphaned += $profile
         }
     }
 
-    # Output status list to log and console
+    # Output status list
     Write-Log "User profile status before deletion:"
     Write-Host "User profile status before deletion:"
     foreach ($entry in $statusList) {
@@ -935,20 +922,19 @@ function Clear-OrphanedProfiles {
         Write-Host $msg
     }
 
-    # Wait for Enter before deleting orphaned profiles (console only)
-    if ($orphaned.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Press Enter to proceed with deleting orphaned profiles, or Ctrl+C to abort..." -ForegroundColor Yellow
-        if ($host.Name -ne 'Windows PowerShell ISE Host') {
-            [void][System.Console]::ReadLine()
-        } else {
-            Write-Host "(ISE detected: waiting 10 seconds instead of keypress...)" -ForegroundColor Yellow
-            Start-Sleep -Seconds 10
-        }
-    } else {
+    if ($orphaned.Count -eq 0) {
         Write-Log "No orphaned profiles found for deletion."
         Write-Host "No orphaned profiles found for deletion."
         return
+    }
+
+    Write-Host ""
+    Write-Host "Press Enter to proceed with deleting orphaned profiles, or Ctrl+C to abort..." -ForegroundColor Yellow
+    if ($host.Name -ne 'Windows PowerShell ISE Host') {
+        [void][System.Console]::ReadLine()
+    } else {
+        Write-Host "(ISE detected: waiting 10 seconds instead of keypress...)" -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
     }
 
     # Proceed with deletion
@@ -956,7 +942,7 @@ function Clear-OrphanedProfiles {
     $bytesDeleted = 0
     $failedDeletions = @()
     foreach ($profile in $orphaned) {
-        $result = Remove-Safe -Path $profile.FullName
+        $result = Remove-Safe -Path $profile.Path
         $bytesBefore += $result.BytesBefore
         $bytesDeleted += $result.BytesDeleted
         foreach ($r in $result.Results) {
@@ -990,6 +976,35 @@ function Get-FreeSpaceGB {
 }
 
 # --- Outputs a summary of the clean-up, including space saved and any failures ---
+
+function Write-SummaryTable {
+    param(
+        [hashtable]$StepSizes,
+        [bool]$IsWhatIf
+    )
+    $totalBefore = 0
+    $totalDeleted = 0
+    $totalAfter = 0
+    foreach ($step in $StepSizes.Keys) {
+        $before = $StepSizes[$step].Before | Convert-Size -To GB
+        $deleted = $StepSizes[$step].Deleted | Convert-Size -To GB
+        $after = $before - $deleted
+        $totalBefore += $before
+        $totalDeleted += $deleted
+        $totalAfter += $after
+        If ($IsWhatIf) {
+            Write-Log ("{0,-30} {1,17:N3}" -f $step, $before)
+        } else {
+            Write-Log ("{0,-20} {1,12:N3} {2,14:N3} {3,12:N3}" -f $step, $before, $deleted, $after)
+        }
+    }
+    return @{
+        TotalBefore = $totalBefore
+        TotalDeleted = $totalDeleted
+        TotalAfter = $totalAfter
+    }
+}
+
 function Show-Summary {
     param(
         [Parameter(Mandatory = $true)]
@@ -1025,24 +1040,11 @@ function Show-Summary {
         Write-Log ("{0,-20} {1,12} {2,14} {3,12}" -f "Action", "Before (GB)", "Deleted (GB)", "Now (GB)")
     }
 
-    $totalBefore = 0
-    $totalDeleted = 0
-    $totalAfter = 0
-    # Get the free space before clean-up, the free space after clean-up, and the total size of files deleted
-    foreach ($step in $script:StepSizes.Keys) {
-        $before = $script:StepSizes[$step].Before | Convert-Size -To GB
-        $deleted = $script:StepSizes[$step].Deleted | Convert-Size -To GB
-        $after = $before - $deleted
-        $totalBefore += $before
-        $totalDeleted += $deleted
-        $totalAfter += $after
-        # Log the step results into summary table
-        If ($IsWhatIf) {
-            Write-Log ("{0,-30} {1,17:N3}" -f $step, $before)
-        } else {
-            Write-Log ("{0,-20} {1,12:N3} {2,14:N3} {3,12:N3}" -f $step, $before, $deleted, $after)
-        }
-    }
+    $summaryTotals = Write-SummaryTable -StepSizes $script:StepSizes -IsWhatIf $IsWhatIf
+    $totalBefore = $summaryTotals.TotalBefore
+    $totalDeleted = $summaryTotals.TotalDeleted
+    $totalAfter = $summaryTotals.TotalAfter
+
     Write-Log ""
     # Log the total sizes
     If ($IsWhatIf) {
@@ -1199,7 +1201,7 @@ try {
     } else {
         $timeout = 30
         Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
-        Write-Host " Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColor Yellow
+        Write-Host " Press Enter to continue immediately, or q/Q/Ctrl+C to abort..." -ForegroundColor Yellow
     }
     #Wait for user input or timeout. Stopwatch object to track elapsed time.
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1215,6 +1217,10 @@ try {
                 $key = [console]::ReadKey($true)
                 if ($key.Key -eq 'Enter') {
                     break
+                }
+                if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
+                Write-Host "`nUser cancelled with Q. Exiting..." -ForegroundColor Yellow
+                exit 2
                 }
                 # Ignore other keys
             }
@@ -1240,7 +1246,7 @@ try {
             } catch {
                 $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
                 Write-Log "Error in step '$step': $msg"
-                #Write-ErrorLog -Operation $step -Message $msg -ErrorRecord $_
+                Write-ErrorLog -Operation $step -Message $msg -ErrorRecord $_
             }
         }
     }
