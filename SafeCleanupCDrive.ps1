@@ -13,10 +13,10 @@
     2025-05-23
 
 .LASTUPDATED
-    2025-06-03
+    2025-06-04
 
 .VERSION
-    1.2.0
+    1.3.0
 
 .CHANGELOG
     2025-05-23: Initial version.
@@ -37,9 +37,9 @@
         - Added Administrator check at the start of the script
 
 .PARAMETER CleanupWindowsTemp
-    Clean C:\Windows\Temp
+    Clean Windows\Temp
 .PARAMETER CleanupCTemp
-    Clean C:\Temp
+    Clean Temp
 .PARAMETER CleanupUserTemp
     Clean user profile temp folders
 .PARAMETER CleanupWindowsUpdate
@@ -57,9 +57,11 @@
 .PARAMETER CleanupRecentFiles
     Clean Recent Files - Disabled by default
 .PARAMETER CleanupWindowsPatchCache
-    Clean C:\Windows\Installer\$PatchCache - Disabled by default
+    Clean Windows\Installer\$PatchCache - Disabled by default
 .PARAMETER CleanupIISLogs
-    Compresses IIS Logs >30 days old to an Archive subfolder and deletes archived >60 days old - Disabled by default
+    Compresses IIS Logs to an Archive subfolder and delete old archived logs - Disabled by default
+.PARAMETER CleanupOrphanedProfiles
+    Delete user profiles for accounts that are disabled or no longer exist in AD - Disabled by default
 
 .NOTES
     Run as Administrator.
@@ -69,7 +71,15 @@
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [Parameter()]
-    [string]$LogFilePath = (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
+    [ValidateNotNullOrEmpty()]
+    [string]$LogFilePath = $( 
+        # Use $PSScriptRoot if available, otherwise fallback to current directory
+        if ($PSScriptRoot) {
+            Join-Path -Path $PSScriptRoot -ChildPath ("SafeCleanupCDrive_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        } else {
+            Join-Path -Path (Get-Location) -ChildPath ("SafeCleanupCDrive_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        }
+    ),
     [Parameter()]
     [switch]$CleanupWindowsTemp,
     [Parameter()]
@@ -93,7 +103,9 @@ param(
     [Parameter()]
     [switch]$CleanupWindowsPatchCache,
     [Parameter()]
-    [switch]$CleanupIISLogs
+    [switch]$CleanupIISLogs,
+    [Parameter()]
+    [switch]$CleanupOrphanedProfiles
 )
 
 # --- ADMINISTRATOR CHECK ---
@@ -115,23 +127,25 @@ if (-not $isAdmin) {
 
 # --- DEFAULT PARAMETER HANDLING ---
 # --- Set default options if not specified ---
-if (-not $PSBoundParameters.ContainsKey('CleanupWindowsTemp'))      { $CleanupWindowsTemp      = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupCTemp'))            { $CleanupCTemp            = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupUserTemp'))         { $CleanupUserTemp         = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupWindowsUpdate'))    { $CleanupWindowsUpdate    = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupIvantiPatchCache')) { $CleanupIvantiPatchCache = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupFontCache'))        { $CleanupFontCache        = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupRecycleBin'))       { $CleanupRecycleBin       = $true }
+if (-not $PSBoundParameters.ContainsKey('CleanupWindowsTemp'))      { $CleanupWindowsTemp      = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupCTemp'))            { $CleanupCTemp            = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupUserTemp'))         { $CleanupUserTemp         = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupWindowsUpdate'))    { $CleanupWindowsUpdate    = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupIvantiPatchCache')) { $CleanupIvantiPatchCache = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupFontCache'))        { $CleanupFontCache        = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupRecycleBin'))       { $CleanupRecycleBin       = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupShadowCopies'))     { $CleanupShadowCopies     = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPrefetch'))  { $CleanupWindowsPrefetch  = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupRecentFiles'))      { $CleanupRecentFiles      = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPatchCache')){ $CleanupWindowsPatchCache= $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupIISLogs'))          { $CleanupIISLogs          = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupOrphanedProfiles')) { $CleanupOrphanedProfiles = $true }
+
 
 # GLOBAL VARIABLES AND CONFIG
 # --- Initialise script variables ---
 $scriptStartTime = Get-Date
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
 $startDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not $script:StepSizes) { $script:StepSizes = @{} }
 
@@ -158,40 +172,42 @@ if (-not (Test-Path $parentDir)) {
 }
 # Write initial log entry with start time
 Set-Content -Path $LogFile -Value "SafeCleanupCDrive started: $(Get-Date)`n" -WhatIf:$false
+$ProgramData = [Environment]::GetFolderPath('CommonApplicationData')
 
 # Define the configuration for each clean-up step
 $CleanupConfig = @{
     WindowsTemp = @{
-        Paths = @("C:\Windows\Temp\*")
-        Description = "Clean C:\Windows\Temp"
+        Paths = @("$env:SystemRoot\Temp\*")
+        Description = "Clean $env:SystemRoot\Temp"
     }
     CTemp = @{
         Paths = @("C:\Temp\*")
         Description = "Clean C:\Temp"
     }
     UserTemp = @{
-        DynamicPaths = { Get-NonSystemUserProfiles | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp\*' } }
+        AccountTypes = @('Domain','Local')
+        DynamicPaths = { param($config) Get-UserProfilePaths -AccountTypes $config.AccountTypes -SubPath 'AppData\Local\Temp\*' }
         Description = "Clean user profile temp folders"
     }
     WindowsUpdate = @{
         Paths = @(
-            "C:\Windows\SoftwareDistribution\Download\*",
-            "C:\Windows\SoftwareDistribution\Datastore\*",
-            "C:\Windows\Logs\CBS\*"
+            "$env:SystemRoot\SoftwareDistribution\Download\*",
+            "$env:SystemRoot\SoftwareDistribution\Datastore\*",
+            "$env:SystemRoot\Logs\CBS\*"
         )
         ServiceName = "wuauserv"
         Description = "Clean Windows Update leftovers"
     }
     IvantiPatchCache = @{
         Paths = @(
-            "C:\Windows\ProPatches\Patches\*",
+            "$env:SystemRoot\ProPatches\Patches\*",
             "C:\ProPatch\Cache\*",
-            "C:\ProgramData\ProPatch\Cache\*"
+            "$ProgramData\ProPatch\Cache\*"
         )
         Description = "Clean Ivanti ProPatch cache"
     }
     FontCache = @{
-        Paths = @("C:\Windows\ServiceProfiles\LocalService\AppData\Local\FontCache\*")
+        Paths = @("$env:SystemRoot\ServiceProfiles\LocalService\AppData\Local\FontCache\*")
         ServiceName = "FontCache"
         Description = "Clean font cache and restart FontCache service"
     }
@@ -204,16 +220,20 @@ $CleanupConfig = @{
         Description = "Delete all shadow copies"
     }
     WindowsPrefetch = @{
-        Paths = @("C:\Windows\Prefetch\*")
+        Paths = @("$env:SystemRoot\Prefetch\*")
         Description = "Clean Windows Prefetch"
     }
     RecentFiles = @{
-        DynamicPaths = { Get-NonSystemUserProfiles | ForEach-Object { Join-Path $_.FullName 'AppData\Roaming\Microsoft\Windows\Recent\*' } }
+        AccountTypes = @('Domain','Local')
+        DynamicPaths = { param($config) Get-UserProfilePaths -AccountTypes $config.AccountTypes -SubPath 'AppData\Roaming\Microsoft\Windows\Recent\*' }
         Description = "Clean Recent Files"
     }
     WindowsPatchCache = @{
-        Paths = @("C:\Windows\Installer\$PatchCache$\*")
-        Description = "Clean C:\Windows\Installer\$PatchCache$"
+        Paths = @(
+            "$env:SystemRoot\Installer\`$PatchCache`$\*",
+            "$env:SystemRoot\Installer\PatchCache\*"
+        )
+        Description = "Clean $env:SystemRoot\Installer\$PatchCache$"
     }
     IISLogs = @{
         LogFolder = "C:\inetpub\logs\LogFiles"
@@ -222,7 +242,11 @@ $CleanupConfig = @{
         ArchiveDeletionDays = 60
         Description = "Compress IIS Logs >30 days old to an Archive subfolder and delete archived >60 days old"
     }
-
+    OrphanedProfiles = @{
+        SpecialHandler = 'Clear-OrphanedProfiles'
+        AccountTypes = @('Domain')
+        Description = "Delete user profiles for disabled or non-existent AD accounts"
+    }
 }
 
 # --- DATA STRUCTURES ---
@@ -354,37 +378,141 @@ $UserAccountExcludePatterns = @(
     '^S_', '^svc', '^admin$', '^administrator$', '^admin\d+$', '^adm$', '^adm\d+$', '^sys', '^test$', '^test\d+$'
 )
 
-# --- Checks if a user profile should be excluded from clean-up based on name patterns or system accounts ---
-function Test-ExcludedUserProfile {
+function Get-UserProfilePaths {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$userName
+        [string[]]$AccountTypes,
+        [string]$SubPath
     )
-    return ($userName -in $SystemAccounts) -or ($UserAccountExcludePatterns | Where-Object { $_ -and $userName -match $_ })
-}
-
-# --- Gets all non-system user profiles on the system ---
-function Get-NonSystemUserProfiles {
-    Get-ChildItem 'C:\Users' -Directory | Where-Object {
-        -not (Test-ExcludedUserProfile $_.Name)
+    $Global:UserProfiles | Where-Object { $_.AccountType -in $AccountTypes } | ForEach-Object {
+        Join-Path $_.Path $SubPath
     }
 }
 
-# --- Checks if a given path exists and is safe to clean (handles wildcards) ---
-function Test-SafePath {
+function Get-UserProfileType {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$ProfileName,
+        [Parameter(Mandatory = $true)]
+        [string]$SID,
+        [Parameter(Mandatory = $true)]
+        [string]$LocalSIDPrefix
     )
-    
-    $hasWildcard = $Path.Contains('*')
-    # Check if the path contains wildcards
-    $basePath = if ($hasWildcard) { Split-Path $Path -Parent } else { $Path }
-    # Normalize the base path to ensure it exists
-    if (-not (Test-Path $basePath)) {
-        return @{ IsValid = $false; Error = "Path not found: $basePath"; BasePath = $basePath }
+    if ($null -eq $SID) {
+        return "Unknown"
     }
-    return @{ IsValid = $true; Error = $null; BasePath = $basePath; HasWildcard = $hasWildcard }
+    if ($SID -like "S-1-5-80-*") {
+        return "Service"
+    }
+    if ($SID -like "$LocalSIDPrefix*") {
+        if ($SID -match '-500$') { return "DefaultAdmin" }
+        if ($SID -match '-501$') { return "DefaultGuest" }
+        return "Local"
+    }
+    if ($ProfileName -in $SystemAccounts -or ($UserAccountExcludePatterns | Where-Object { $_ -and $ProfileName -match $_ })) {
+        return "System"
+    }
+    return "Domain"
+}
+
+function Get-UserProfiles {
+    $usersPath = "$env:SystemDrive\Users"
+    $localSIDPrefix = Get-LocalMachineSIDPrefix
+    $profileSIDMap = Get-ProfileSIDMap
+    $profiles = Get-ChildItem $usersPath -Directory
+    $results = @()
+    foreach ($profile in $profiles) {
+        $sid = $profileSIDMap[$profile.Name]
+        $accountType = Get-UserProfileType -ProfileName $profile.Name -SID $sid -LocalSIDPrefix $localSIDPrefix
+        $results += [PSCustomObject]@{
+            Name        = $profile.Name
+            Path        = $profile.FullName
+            SID         = $sid
+            AccountType = $accountType
+        }
+    }
+    return $results
+}
+
+function Get-LdapUser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Username
+    )
+    try {
+        $domainDN = ([ADSI]"LDAP://RootDSE").defaultNamingContext
+        if (-not $domainDN) {
+            Write-Error "LDAP query failed: Could not determine defaultNamingContext (domainDN is null or empty)."
+            return $null
+        }
+        $ldapPath = "LDAP://$domainDN"
+        $searcher = New-Object DirectoryServices.DirectorySearcher([ADSI]$ldapPath)
+        $searcher.Filter = "(&(objectClass=user)(sAMAccountName=$Username))"
+        $searcher.PropertiesToLoad.AddRange(@("distinguishedName","displayName","mail","userAccountControl"))
+        $result = $searcher.FindOne()
+        if ($null -eq $result) {
+            Write-Error "LDAP query failed: No result found for user '$Username'."
+            return $null
+        }
+        if ($null -eq $result.Properties -or $result.Properties.Count -eq 0) {
+            Write-Error "LDAP query failed: No properties returned for user '$Username'."
+            return $null
+        }
+        $user = $result.Properties
+        # Defensive checks for each property
+        return [PSCustomObject]@{
+            DistinguishedName = if ($user.distinguishedname.Count -gt 0) { $user.distinguishedname[0] } else { $null }
+            DisplayName       = if ($user.displayname.Count -gt 0) { $user.displayname[0] } else { $null }
+            Email             = if ($user.mail.Count -gt 0) { $user.mail[0] } else { $null }
+            UserAccountControl= if ($user.useraccountcontrol.Count -gt 0) { $user.useraccountcontrol[0] } else { $null }
+        }
+    } catch {
+        Write-Error "LDAP query failed for user '$Username': $_"
+        return $null
+    }
+}
+
+function Get-LocalMachineSIDPrefix {
+    # Returns the SID prefix for local accounts (e.g., S-1-5-21-xxxx-xxxx-xxxx)
+    $computerSID = (Get-WmiObject Win32_UserAccount -Filter "LocalAccount=True" | Select-Object -First 1).SID
+    if ($computerSID) {
+        # Remove the last part (RID) to get the prefix
+        return ($computerSID -replace '\-\d+$','')
+    }
+    return $null
+}
+
+# --- User Profile SID Mapping with CIM/WMI/Hardcoded fallback ---
+
+function Get-ProfileSIDMap {
+    $map = @{}
+    $usersPath = "$env:SystemDrive\Users"
+    $folders = Get-ChildItem $usersPath -Directory
+    # Try CIM first
+    try {
+        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath -like "$usersPath\*" }
+        foreach ($profile in $profiles) {
+            $folder = Split-Path $profile.LocalPath -Leaf
+            $map[$folder] = $profile.SID
+        }
+    } catch {
+        # Fallback to WMI
+        try {
+            $profiles = Get-WmiObject Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath -like "$usersPath\*" }
+            foreach ($profile in $profiles) {
+                $folder = Split-Path $profile.LocalPath -Leaf
+                $map[$folder] = $profile.SID
+            }
+        } catch {
+            Write-Log "WARNING: Falling back to folder names for profile SID mapping. Orphaned profile detection may be less accurate." -Colour Yellow
+        }
+    }
+    # Ensure every folder is mapped (even if not in Win32_UserProfile)
+    foreach ($folder in $folders) {
+        if (-not $map.ContainsKey($folder.Name)) {
+            $map[$folder.Name] = $null
+        }
+    }
+    return $map
 }
 
 # --- CORE CLEANUP FUNCTIONS ---
@@ -398,10 +526,11 @@ function Set-ServiceState {
         [ValidateSet('Running', 'Stopped')]
         [string]$State,
         [Parameter()]
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [Parameter()]
+        [switch]$AbortOnFailure
     )
     try {
-        # Check if the service exists and is in the desired state
         $service = Get-Service -Name $Name -ErrorAction Stop
         if ($service.Status -eq $State) {
             Write-Log "Service $Name is already $State" -LogOnly
@@ -409,9 +538,7 @@ function Set-ServiceState {
         }
         if ($PSCmdlet.ShouldProcess($Name, "Set service to $State")) {
             Write-Log "Setting service $Name to $State" -LogOnly
-            # Start a timer to wait for the service to change state
             $timer = [System.Diagnostics.Stopwatch]::StartNew()
-            # Start or stop the service based on the desired state
             if ($State -eq 'Running') { $service.Start() } else { $service.Stop() }
             do {
                 Start-Sleep -Milliseconds 500
@@ -423,18 +550,22 @@ function Set-ServiceState {
                 }
             } while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds)
             $timer.Stop()
-            # Log a warning if the service did not reach the desired state within the timeout
             Write-ErrorLog -Operation "Service$State" `
                 -Message "Timeout waiting for service $Name to reach status $State" `
-                -Severity 'Warning'
+                -Severity 'Critical'
+            if ($AbortOnFailure) {
+                throw "Critical: Service $Name did not reach $State in time."
+            }
             return $false
         }
     } catch {
-        # Log the error and return false
         Write-ErrorLog -Operation "Service$State" `
             -Message "Failed to set service $Name to $State" `
             -ErrorRecord $_ `
-            -Severity 'Warning'
+            -Severity 'Critical'
+        if ($AbortOnFailure) {
+            throw "Critical: Service $Name failed to change state."
+        }
         return $false
     }
 }
@@ -466,7 +597,11 @@ function Remove-Safe {
         }
     }
 
+    $totalItems = $items.Count
+    $currentItem = 0
     foreach ($item in $items) {
+        $currentItem++
+        Write-Progress -Activity "Deleting items" -Status "$currentItem of $totalItems" -PercentComplete (($currentItem / $totalItems) * 100)
         if ($item.PSIsContainer) {
             # Directory: get all files and subdirs recursively
             $allFiles = @(Get-ChildItem -Path $item.FullName -File -Recurse -Force -ErrorAction SilentlyContinue)
@@ -533,7 +668,7 @@ function Remove-Safe {
             }
         }
     }
-
+    Write-Progress -Activity "Deleting items" -Completed
     return [PSCustomObject]@{
         Results = $results
         BytesBefore = $bytesBefore
@@ -743,6 +878,101 @@ function Clear-ShadowCopies {
     }
 }
 
+function Clear-OrphanedProfiles {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $profileSIDMap = Get-ProfileSIDMap
+    $profiles = Get-ChildItem "$env:SystemDrive\Users" -Directory
+    $statusList = @()
+    $orphaned = @()
+    $domainNetbios = (Get-WmiObject Win32_NTDomain | Where-Object { $_.DnsForestName } | Select-Object -First 1).DomainName
+    $localSIDPrefix = Get-LocalMachineSIDPrefix
+
+    foreach ($profile in $profiles) {
+        $sid = $profileSIDMap[$profile.Name]
+        $profileType = Get-UserProfileType -ProfileName $profile.Name -SID $sid -LocalSIDPrefix $localSIDPrefix
+        $status = $profileType
+        $isOrphaned = $false
+
+        if ($profileType -eq "Domain") {
+            # Extract username if folder ends with .DOMAIN
+            $adUser = $profile.Name
+            if ($domainNetbios -and $profile.Name -like "*.$domainNetbios") {
+                $adUser = $profile.Name.Substring(0, $profile.Name.Length - $domainNetbios.Length - 1)
+            }
+            $userObj = Get-LdapUser -Username $adUser
+            if (-not $userObj) {
+                $status = "Not found in AD"
+                $isOrphaned = $true
+            } elseif (($userObj.UserAccountControl -band 2) -ne 0) {
+                $status = "Disabled in AD"
+                $isOrphaned = $true
+            } else {
+                $status = "Active in AD"
+            }
+        } elseif ($profileType -eq "Unknown") {
+            $status = "No SID mapping"
+            $isOrphaned = $true
+        }
+
+        $statusList += [PSCustomObject]@{
+            Profile = $profile.Name
+            Path    = $profile.FullName
+            Status  = $status
+        }
+
+        if ($isOrphaned) {
+            $orphaned += $profile
+        }
+    }
+
+    # Output status list to log and console
+    Write-Log "User profile status before deletion:"
+    Write-Host "User profile status before deletion:"
+    foreach ($entry in $statusList) {
+        $msg = "{0,-20} {1,-40} {2}" -f $entry.Profile, $entry.Path, $entry.Status
+        Write-Log $msg
+        Write-Host $msg
+    }
+
+    # Wait for Enter before deleting orphaned profiles (console only)
+    if ($orphaned.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Press Enter to proceed with deleting orphaned profiles, or Ctrl+C to abort..." -ForegroundColor Yellow
+        if ($host.Name -ne 'Windows PowerShell ISE Host') {
+            [void][System.Console]::ReadLine()
+        } else {
+            Write-Host "(ISE detected: waiting 10 seconds instead of keypress...)" -ForegroundColor Yellow
+            Start-Sleep -Seconds 10
+        }
+    } else {
+        Write-Log "No orphaned profiles found for deletion."
+        Write-Host "No orphaned profiles found for deletion."
+        return
+    }
+
+    # Proceed with deletion
+    $bytesBefore = 0
+    $bytesDeleted = 0
+    $failedDeletions = @()
+    foreach ($profile in $orphaned) {
+        $result = Remove-Safe -Path $profile.FullName
+        $bytesBefore += $result.BytesBefore
+        $bytesDeleted += $result.BytesDeleted
+        foreach ($r in $result.Results) {
+            if (-not $r.Success) {
+                $failedDeletions += $r.Path
+            }
+        }
+    }
+    Add-StepResult -StepName "OrphanedProfiles" -BytesBefore $bytesBefore -BytesDeleted $bytesDeleted
+    if ($failedDeletions.Count -gt 0) {
+        Write-Log "Failed to delete the following orphaned profiles:" -LogOnly
+        $failedDeletions | ForEach-Object { Write-Log " - $_" -LogOnly }
+    }
+    Write-Log "-- FINISHED: Orphaned user profile cleanup --"
+}
+
 # --- SUMMARY AND REPORTING FUNCTIONS ---
 # --- Returns the free space on C: in GB, or "Unknown" if it can't be determined ---
 function Get-FreeSpaceGB {
@@ -881,7 +1111,7 @@ function Invoke-Cleanup {
             return
         }
         # Get paths to clean (static or dynamic)
-        $paths = if ($config.DynamicPaths) { & $config.DynamicPaths } else { $config.Paths }
+        $paths = if ($config.DynamicPaths) { & $config.DynamicPaths $config } else { $config.Paths }
         $beforeTotal = 0
         $deletedTotal = 0
         foreach ($path in $paths) {
@@ -958,29 +1188,49 @@ try {
     Write-Log "`nMode: $(if ($IsWhatIf) {'Simulation (no files will be deleted)'} else {'Live Execution (files will be deleted)'})"
     Write-Log "Output will be logged to: $LogFile`n"
     Write-Host ""
-    $timeout = 30
-    Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
-    Write-Host "Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColor Yellow
     
-    # Wait for user input or timeout. Stopwatch object to track elapsed time.
+    # --- Countdown to give user a chance to cancel script ---
+    $isISE = $host.Name -eq 'Windows PowerShell ISE Host'
+    If ($isISE) {
+        # In ISE it cannot accept key input, so just wait for timeout
+        $timeout = 10
+        Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
+        Write-Host "Press Ctrl+C to abort..." -ForegroundColor Yellow
+    } else {
+        $timeout = 30
+        Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
+        Write-Host " Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColor Yellow
+    }
+    #Wait for user input or timeout. Stopwatch object to track elapsed time.
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    # Loop until timeout or user input
     while ($sw.Elapsed.TotalSeconds -lt $timeout) {
         $remaining = [math]::Ceiling($timeout - $sw.Elapsed.TotalSeconds)
-        # Updates same line in console with updated countdown
-        Write-Host ("Continuing in {0} seconds..." -f $remaining) -NoNewline
-        Start-Sleep -Seconds 1
-        if ([System.Console]::KeyAvailable) {
-            $null = [System.Console]::ReadLine()
-            break
+        If ($isISE) {
+            # In ISE, print each countdown on a new line
+            Write-Host ("Continuing in {0} seconds..." -f $remaining)
+        } else {
+            # In console, updates same line with updated countdown
+            Write-Host ("Continuing in {0} seconds..." -f $remaining) -NoNewline
+            if ([console]::KeyAvailable) {
+                $key = [console]::ReadKey($true)
+                if ($key.Key -eq 'Enter') {
+                    break
+                }
+                # Ignore other keys
+            }
+            Write-Host "`r" -NoNewline
         }
-        Write-Host "`r" -NoNewline
+        Start-Sleep -Seconds 1
     }
     $sw.Stop()
     Write-Host ""
     Write-Log ("========== {0} Safe clean-up of C: drive started: {1} ==========" -f ($(if ($IsWhatIf) {'[WhatIf]'} else {''}), (Get-Date)))
     Write-Log ""
     Start-Sleep 5
+    # Check if we need to get user profile information
+    if ($CleanupUserTemp -or $CleanupRecentFiles -or $CleanupOrphanedProfiles) {
+       $Global:UserProfiles = Get-UserProfiles
+    }
     # --- Execute each cleanup step with nested try/catch ---
     foreach ($step in $CleanupConfig.Keys) {
         $switchName = "Cleanup$step"

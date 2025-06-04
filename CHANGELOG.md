@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## [1.3.0] - 2025-06-04
+### Added
+- Centralized user profile discovery and filtering: introduced `Get-UserProfiles` and improved `Get-UserProfileType` for robust account type detection (Domain, Local, Service, System, DefaultAdmin, DefaultGuest, Unknown).
+- `AccountTypes` array added to relevant steps in `$CleanupConfig` for explicit control over which user profile types are processed per cleanup step.
+- Helper function `Get-UserProfilePaths` for DRY, consistent dynamic path generation based on allowed account types.
+- Improved SID mapping: `Get-ProfileSIDMap` now ensures all folders in `C:\Users` are mapped, even if not registered in Win32_UserProfile.
+- Enhanced LDAP lookup logic: only performed for true domain accounts, with correct username extraction for `.DOMAIN` profile folders.
+- Service SIDs and built-in/renamed Administrator and Guest accounts are now reliably excluded from all user profile operations.
+
+### Changed
+- All user-profile-based cleanup steps (UserTemp, RecentFiles, OrphanedProfiles) now use the centralized user profile list and account type filtering for consistency and maintainability.
+- Refactored redundant or legacy filtering functions; logic is now unified and easier to maintain.
+- Updated dynamic path generation in `$CleanupConfig` to reference `AccountTypes` directly, eliminating duplication.
+
+### Fixed
+- Fixed issues where local, service, or renamed system accounts could be incorrectly processed or trigger LDAP errors.
+- Improved handling of user profiles present in `C:\Users` but missing from WMI/CIM profile lists.
+- Corrected username extraction for domain profiles with dots in the username or domain name.
+
+---
+
 ## [1.2.0] - 2025-06-03
 ### Added
 - Administrator privilege check at script start; script exits with a message if not run as admin.
