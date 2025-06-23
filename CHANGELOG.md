@@ -1,8 +1,15 @@
 # CHANGELOG
 
+## [1.3.1] - 2025-06-23
+- Converted `Get-UserProfileType` and `Get-UserProfiles` to inclusion approach instead of exclusion.
+- Added `Get-ProfileInfo` to check for profiles over a specified size and/or not accessed in a long time. Any profiles not picked up int he inclusion approach will be reported in the console and logfile but not actioned.
+- Added progress indicator to Remove-Safe and additional output to console so easier to track progress
+- Minor fixes to summary output
+- Added #endregion to each region for consistency
+
 ## [1.3.0] - 2025-06-04
 ### Added
-- Centralized user profile discovery and filtering: introduced `Get-UserProfiles` and improved `Get-UserProfileType` for robust account type detection (Domain, Local, Service, System, DefaultAdmin, DefaultGuest, Unknown).
+- Centralised user profile discovery and filtering: introduced `Get-UserProfiles` and improved `Get-UserProfileType` for robust account type detection (Domain, Local, Service, System, DefaultAdmin, DefaultGuest, Unknown).
 - `AccountTypes` array added to relevant steps in `$CleanupConfig` for explicit control over which user profile types are processed per cleanup step.
 - Helper function `Get-UserProfilePaths` for DRY, consistent dynamic path generation based on allowed account types.
 - Improved SID mapping: `Get-ProfileSIDMap` now ensures all folders in `C:\Users` are mapped, even if not registered in Win32_UserProfile.
@@ -10,7 +17,7 @@
 - Service SIDs and built-in/renamed Administrator and Guest accounts are now reliably excluded from all user profile operations.
 
 ### Changed
-- All user-profile-based cleanup steps (UserTemp, RecentFiles, OrphanedProfiles) now use the centralized user profile list and account type filtering for consistency and maintainability.
+- All user-profile-based cleanup steps (UserTemp, RecentFiles, OrphanedProfiles) now use the centralised user profile list and account type filtering for consistency and maintainability.
 - Refactored redundant or legacy filtering functions; logic is now unified and easier to maintain.
 - Updated dynamic path generation in `$CleanupConfig` to reference `AccountTypes` directly, eliminating duplication.
 
