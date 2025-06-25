@@ -13,33 +13,15 @@
     2025-05-23
 
 .LASTUPDATED
-    2025-06-03
+    2025-06-23
 
 .VERSION
-    1.2.0
-
-.CHANGELOG
-    2025-05-23: Initial version.
-    2025-05-24: 
-        - Modularised clean-up functions and improved logging.
-        - Unified summary reporting with per-step size tracking.
-        - Enhanced WhatIf handling and error reporting.
-        - Improved user profile filtering and code readability.
-    2025-05-26:
-        - Added consistent parameter block formatting and comments for all functions.
-        - Improved logging and error handling
-        - Added detailed comments and explanations for maintainability.
-        - Added countdown and user-interruptible pause before execution.
-        - Enhanced Recycle Bin and shadow copy handling and reporting.
-        - Added class for structured removal results.
-        - General code clean-up and uniformity improvements.
-    2025-06-02:
-        - Added Administrator check at the start of the script
+    1.3.1
 
 .PARAMETER CleanupWindowsTemp
-    Clean C:\Windows\Temp
+    Clean Windows\Temp
 .PARAMETER CleanupCTemp
-    Clean C:\Temp
+    Clean Temp
 .PARAMETER CleanupUserTemp
     Clean user profile temp folders
 .PARAMETER CleanupWindowsUpdate
@@ -51,15 +33,17 @@
 .PARAMETER CleanupRecycleBin
     Empty Recycle Bin
 .PARAMETER CleanupShadowCopies
-    Delete all shadow copies -Disabled by default
+    Delete all shadow copies - Disabled by default
 .PARAMETER CleanupWindowsPrefetch
-    Clean Windows Prefetch -Disabled by default
+    Clean Windows Prefetch - Disabled by default
 .PARAMETER CleanupRecentFiles
     Clean Recent Files - Disabled by default
 .PARAMETER CleanupWindowsPatchCache
-    Clean C:\Windows\Installer\$PatchCache - Disabled by default
+    Clean Windows\Installer\$PatchCache - Disabled by default
 .PARAMETER CleanupIISLogs
-    Compresses IIS Logs >30 days old to an Archive subfolder and deletes archived >60 days old - Disabled by default
+    Compresses IIS Logs to an Archive subfolder and delete old archived logs - Disabled by default
+.PARAMETER CleanupOrphanedProfiles
+    Delete user profiles for accounts that are disabled or no longer exist in AD - Disabled by default
 
 .NOTES
     Run as Administrator.
@@ -69,7 +53,15 @@
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [Parameter()]
-    [string]$LogFilePath = (Join-Path -Path (Split-Path -Parent $MyInvocation.MyCommand.Path) -ChildPath "SafeCleanupCDrive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
+    [ValidateNotNullOrEmpty()]
+    [string]$LogFilePath = $( 
+        # Use $PSScriptRoot if available, otherwise fallback to current directory
+        if ($PSScriptRoot) {
+            Join-Path -Path $PSScriptRoot -ChildPath ("SafeCleanupCDrive_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        } else {
+            Join-Path -Path (Get-Location) -ChildPath ("SafeCleanupCDrive_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        }
+    ),
     [Parameter()]
     [switch]$CleanupWindowsTemp,
     [Parameter()]
@@ -93,7 +85,9 @@ param(
     [Parameter()]
     [switch]$CleanupWindowsPatchCache,
     [Parameter()]
-    [switch]$CleanupIISLogs
+    [switch]$CleanupIISLogs,
+    [Parameter()]
+    [switch]$CleanupOrphanedProfiles
 )
 
 # --- ADMINISTRATOR CHECK ---
@@ -116,7 +110,7 @@ if (-not $isAdmin) {
 # --- DEFAULT PARAMETER HANDLING ---
 # --- Set default options if not specified ---
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsTemp'))      { $CleanupWindowsTemp      = $true }
-if (-not $PSBoundParameters.ContainsKey('CleanupCTemp'))            { $CleanupCTemp            = $true }
+if (-not $PSBoundParameters.ContainsKey('CleanupCTemp'))            { $CleanupCTemp            = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupUserTemp'))         { $CleanupUserTemp         = $true }
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsUpdate'))    { $CleanupWindowsUpdate    = $true }
 if (-not $PSBoundParameters.ContainsKey('CleanupIvantiPatchCache')) { $CleanupIvantiPatchCache = $true }
@@ -127,14 +121,16 @@ if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPrefetch'))  { $CleanupWi
 if (-not $PSBoundParameters.ContainsKey('CleanupRecentFiles'))      { $CleanupRecentFiles      = $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupWindowsPatchCache')){ $CleanupWindowsPatchCache= $false }
 if (-not $PSBoundParameters.ContainsKey('CleanupIISLogs'))          { $CleanupIISLogs          = $false }
+if (-not $PSBoundParameters.ContainsKey('CleanupOrphanedProfiles')) { $CleanupOrphanedProfiles = $false }
+
 
 # GLOBAL VARIABLES AND CONFIG
 # --- Initialise script variables ---
 $scriptStartTime = Get-Date
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
 $startDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not $script:StepSizes) { $script:StepSizes = @{} }
-
+$UserProfileRoot = "$env:SystemDrive\Users"
 
 # --- Initialise logging ---
 if ($LogFilePath) {
@@ -158,40 +154,42 @@ if (-not (Test-Path $parentDir)) {
 }
 # Write initial log entry with start time
 Set-Content -Path $LogFile -Value "SafeCleanupCDrive started: $(Get-Date)`n" -WhatIf:$false
+$ProgramData = [Environment]::GetFolderPath('CommonApplicationData')
 
 # Define the configuration for each clean-up step
 $CleanupConfig = @{
     WindowsTemp = @{
-        Paths = @("C:\Windows\Temp\*")
-        Description = "Clean C:\Windows\Temp"
+        Paths = @("$env:SystemRoot\Temp\*")
+        Description = "Clean $env:SystemRoot\Temp"
     }
     CTemp = @{
         Paths = @("C:\Temp\*")
         Description = "Clean C:\Temp"
     }
     UserTemp = @{
-        DynamicPaths = { Get-NonSystemUserProfiles | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp\*' } }
+        AccountTypes = @('Domain','Local')
+        DynamicPaths = { param($config) Get-UserProfilePaths -AccountTypes $config.AccountTypes -SubPath 'AppData\Local\Temp\*' }
         Description = "Clean user profile temp folders"
     }
     WindowsUpdate = @{
         Paths = @(
-            "C:\Windows\SoftwareDistribution\Download\*",
-            "C:\Windows\SoftwareDistribution\Datastore\*",
-            "C:\Windows\Logs\CBS\*"
+            "$env:SystemRoot\SoftwareDistribution\Download\*",
+            "$env:SystemRoot\SoftwareDistribution\Datastore\*",
+            "$env:SystemRoot\Logs\CBS\*"
         )
         ServiceName = "wuauserv"
         Description = "Clean Windows Update leftovers"
     }
     IvantiPatchCache = @{
         Paths = @(
-            "C:\Windows\ProPatches\Patches\*",
+            "$env:SystemRoot\ProPatches\Patches\*",
             "C:\ProPatch\Cache\*",
-            "C:\ProgramData\ProPatch\Cache\*"
+            "$ProgramData\ProPatch\Cache\*"
         )
         Description = "Clean Ivanti ProPatch cache"
     }
     FontCache = @{
-        Paths = @("C:\Windows\ServiceProfiles\LocalService\AppData\Local\FontCache\*")
+        Paths = @("$env:SystemRoot\ServiceProfiles\LocalService\AppData\Local\FontCache\*")
         ServiceName = "FontCache"
         Description = "Clean font cache and restart FontCache service"
     }
@@ -204,16 +202,20 @@ $CleanupConfig = @{
         Description = "Delete all shadow copies"
     }
     WindowsPrefetch = @{
-        Paths = @("C:\Windows\Prefetch\*")
+        Paths = @("$env:SystemRoot\Prefetch\*")
         Description = "Clean Windows Prefetch"
     }
     RecentFiles = @{
-        DynamicPaths = { Get-NonSystemUserProfiles | ForEach-Object { Join-Path $_.FullName 'AppData\Roaming\Microsoft\Windows\Recent\*' } }
+        AccountTypes = @('Domain','Local')
+        DynamicPaths = { param($config) Get-UserProfilePaths -AccountTypes $config.AccountTypes -SubPath 'AppData\Roaming\Microsoft\Windows\Recent\*' }
         Description = "Clean Recent Files"
     }
     WindowsPatchCache = @{
-        Paths = @("C:\Windows\Installer\$PatchCache$\*")
-        Description = "Clean C:\Windows\Installer\$PatchCache$"
+        Paths = @(
+            "$env:SystemRoot\Installer\`$PatchCache`$\*",
+            "$env:SystemRoot\Installer\PatchCache\*"
+        )
+        Description = "Clean $env:SystemRoot\Installer\$PatchCache$"
     }
     IISLogs = @{
         LogFolder = "C:\inetpub\logs\LogFiles"
@@ -222,10 +224,14 @@ $CleanupConfig = @{
         ArchiveDeletionDays = 60
         Description = "Compress IIS Logs >30 days old to an Archive subfolder and delete archived >60 days old"
     }
-
+    OrphanedProfiles = @{
+        SpecialHandler = 'Clear-OrphanedProfiles'
+        AccountTypes = @('Domain')
+        Description = "Delete user profiles for disabled or non-existent AD accounts"
+    }
 }
 
-# --- DATA STRUCTURES ---
+#region --- DATA STRUCTURES ---
 #--- Represents the result of a file or directory removal operation ---
 class RemovalResult {
     [string]$Path
@@ -239,8 +245,10 @@ class RemovalResult {
         $this.BytesAttempted = $bytes
     }
 }
+#endregion
 
-# --- UTILITY FUNCTIONS ---
+
+#region --- UTILITY FUNCTIONS ---
 # --- Logging function: writes messages to log file and optionally to console ---
 function Write-Log {
     param(
@@ -252,18 +260,21 @@ function Write-Log {
         [System.ConsoleColor]$Colour
     )
 
+    $timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    $logLine = "[$timestamp] $Message"
+
     # Ensure log file exists
     if (-not (Test-Path -Path $LogFile)) {
         New-Item -Path $LogFile -ItemType File -Force -WhatIf:$false | Out-Null
     }
     # Write message to log file
-    Add-Content -Path $LogFile -Value $Message -WhatIf:$false
+    Add-Content -Path $LogFile -Value $logLine -WhatIf:$false
     # Optionally write to console, with colour if specified
     if (-not $LogOnly) {
-        if ($PSBoundParameters.ContainsKey('Colour') -and $Colour) {
-            Write-Host $Message -ForegroundColor $Colour
+        if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Colour') -and $Colour) {
+            Write-Host $logLine -ForegroundColor $Colour
         } else {
-            Write-Host $Message
+            Write-Host $logLine
         }
     }
 }
@@ -349,45 +360,392 @@ function Convert-Size {
 }
 
 # --- User Filtering ---
-$SystemAccounts = @('Default', 'Default User', 'Public', 'All Users', 'Administrator')
-$UserAccountExcludePatterns = @(
-    '^S_', '^svc', '^admin$', '^administrator$', '^admin\d+$', '^adm$', '^adm\d+$', '^sys', '^test$', '^test\d+$'
+# User profile pattern matching - inclusion approach
+$UserAccountIncludePatterns = @(
+    # Standard AD account format: 2 letters followed by 2-7 numbers (with optional 'A' suffix)
+    '^[a-zA-Z]{2}[0-9]{2,7}(A)?$',
+    
+    # DXC format
+    '^DXC\.[a-zA-Z]+\.[a-zA-Z]+$',
+    
+    # Direct firstname.lastname format
+    '^[a-zA-Z]+\.[a-zA-Z]+$',
+    
+    # Temporary profiles
+    '^TEMP'
 )
 
-# --- Checks if a user profile should be excluded from clean-up based on name patterns or system accounts ---
-function Test-ExcludedUserProfile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$userName
-    )
-    return ($userName -in $SystemAccounts) -or ($UserAccountExcludePatterns | Where-Object { $_ -and $userName -match $_ })
-}
+# Define significant size threshold (in GB)
+$SignificantProfileSizeGB = 5
+# Define "long time" not accessed threshold (in days)
+$OldProfileThresholdDays = 180
 
-# --- Gets all non-system user profiles on the system ---
-function Get-NonSystemUserProfiles {
-    Get-ChildItem 'C:\Users' -Directory | Where-Object {
-        -not (Test-ExcludedUserProfile $_.Name)
+<# Keep SystemAccounts for compatibility with other functions
+$SystemAccounts = @(
+    'Default', 'Default User', 'Public', 'All Users', 'Administrator',
+    '.NET v4.5', '.NET v4.5 Classic', 'ASP.NET',
+    'IUSR', 'NetworkService', 'LocalService', 'SYSTEM', 'TrustedInstaller',
+    'MSSQL', 'SQLServer'
+)
+#>
+
+# --- Retrieves user profile paths for specified account types ---
+function Get-UserProfilePaths {
+    param(
+        [string[]]$AccountTypes,
+        [string]$SubPath
+    )
+    $Global:UserProfiles | Where-Object { $_.AccountType -in $AccountTypes } | ForEach-Object {
+        Join-Path $_.Path $SubPath
     }
 }
 
-# --- Checks if a given path exists and is safe to clean (handles wildcards) ---
-function Test-SafePath {
+# --- Determines the type of user profile based on name and SID ---
+function Get-UserProfileType {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$ProfileName,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$SID,
+        [Parameter(Mandatory = $true)]
+        [string]$LocalSIDPrefix
+    )
+    # First check if it matches our known user patterns
+    $isKnownUserPattern = $false
+    foreach ($pattern in $UserAccountIncludePatterns) {
+        if ($ProfileName -match $pattern) {
+            $isKnownUserPattern = $true
+            break
+        }
+    }
+    
+    # Special handling for empty/unknown SIDs
+    if ([string]::IsNullOrEmpty($SID) -or $SID -eq "Unknown-SID") {
+        # If it matches our user patterns, treat as Unknown
+        # Otherwise treat as System to prevent accidental deletion
+        if ($isKnownUserPattern) {
+            return "Unknown"
+        } else {
+            return "System"
+        }
+    }
+    
+    # Handle special Windows accounts
+    if ($SID -like "S-1-5-80-*") {
+        return "Service"
+    }
+    
+    # Handle local accounts
+    if ($SID -like "$LocalSIDPrefix*") {
+        if ($SID -match '-500$') { return "DefaultAdmin" }
+        if ($SID -match '-501$') { return "DefaultGuest" }
+        
+        # Only consider it a normal local user if it matches our patterns
+        If ($isKnownUserPattern) {
+            return "Local"
+        } else {
+            return "System"
+        }
+    }
+    
+    # For domain accounts, only consider it a user if it matches our patterns
+    If ($isKnownUserPattern) {
+        return "Domain"
+    } else {
+        # If it doesn't match our patterns, treat as System
+        return "System"
+    }
+}
+
+# --- Calculate size of each profile folder and last accessed time ---
+function Get-ProfileInfo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilePath
     )
     
-    $hasWildcard = $Path.Contains('*')
-    # Check if the path contains wildcards
-    $basePath = if ($hasWildcard) { Split-Path $Path -Parent } else { $Path }
-    # Normalize the base path to ensure it exists
-    if (-not (Test-Path $basePath)) {
-        return @{ IsValid = $false; Error = "Path not found: $basePath"; BasePath = $basePath }
+    $size = 0
+    $lastAccessed = $null
+    
+    try {
+        # Get folder size (recursive)
+        $size = (Get-ChildItem -Path $ProfilePath -Recurse -Force -ErrorAction SilentlyContinue | 
+                Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+        
+        # Get last accessed time from folder access time
+        $lastAccessed = (Get-Item -Path $ProfilePath -Force -ErrorAction SilentlyContinue).LastAccessTime
+    } catch {
+        Write-Log "Warning: Could not get full information for profile $ProfilePath" -Colour Yellow
     }
-    return @{ IsValid = $true; Error = $null; BasePath = $basePath; HasWildcard = $hasWildcard }
+    
+    return @{
+        Path = $ProfilePath
+        SizeBytes = $size
+        SizeGB = [math]::Round($size / 1GB, 2)
+        LastAccessed = $lastAccessed
+        DaysSinceAccess = if ($lastAccessed) { (New-TimeSpan -Start $lastAccessed -End (Get-Date)).Days } else { $null }
+    }
 }
 
-# --- CORE CLEANUP FUNCTIONS ---
+# --- Retrieves all user profiles on the system, including SID and account type ---
+function Get-UserProfiles {
+    param(
+        [switch]$IncludeSystemProfiles
+    )
+    
+    Write-Log "Starting user profile analysis..." -LogOnly
+    Write-Host "Scanning user profiles..." -ForegroundColor Cyan
+    
+    # Get computer SID prefix for local account detection
+    Write-Log "Getting computer SID for local account detection..." -LogOnly
+    $computerSid = (New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME + "\Administrator")).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $localSIDPrefix = $computerSid.Substring(0, $computerSid.LastIndexOf("-"))
+    Write-Log "Local SID prefix: $localSIDPrefix" -LogOnly
+    
+    # First get a map of profile folders to SIDs
+    Write-Log "Retrieving profile SID mappings..." -LogOnly
+    Write-Host "  Retrieving profile SID mappings..." -ForegroundColor DarkGray
+    $sidMap = Get-ProfileSIDMap
+    Write-Log "Found $(($sidMap.Keys).Count) profile folders" -LogOnly
+    
+    $profiles = @()
+    $nonMatchingProfiles = @()
+    $profileCount = 0
+    $userProfileCount = 0
+    
+    Write-Log "Processing profile folders..." -LogOnly
+    Write-Host "  Processing profile folders in $UserProfileRoot" -ForegroundColor DarkGray
+    
+    $folderCount = (Get-ChildItem -Path $UserProfileRoot -Directory).Count
+    Write-Host "  Found $folderCount profile folders to analyze" -ForegroundColor DarkGray
+    
+    Get-ChildItem -Path $UserProfileRoot -Directory | ForEach-Object {
+        $profilePath = $_.FullName
+        $profileName = $_.Name
+        $profileCount++
+        
+        # Progress indicator
+        if ($profileCount % 5 -eq 0 -or $profileCount -eq $folderCount) {
+            Write-Host "  Processed $profileCount of $folderCount profiles..." -ForegroundColor DarkGray
+        }
+        
+        Write-Log "Processing profile: $profileName" -LogOnly
+        
+        # Get the SID for this profile
+        $sid = $sidMap[$profileName]
+        if ([string]::IsNullOrEmpty($sid)) {
+            $sid = "Unknown-SID"
+            Write-Log "  No SID found for $profileName, using placeholder" -LogOnly
+        }
+        
+        # Determine profile type
+        Write-Log "  Determining profile type..." -LogOnly
+        $profileType = Get-UserProfileType -ProfileName $profileName -SID $sid -LocalSIDPrefix $localSIDPrefix
+        Write-Log "  Profile type: $profileType" -LogOnly
+        
+        # Get basic info about last accessed time
+        try {
+            $lastAccessed = (Get-Item -Path $profilePath -Force -ErrorAction SilentlyContinue).LastAccessTime
+            $daysSinceAccess = (New-TimeSpan -Start $lastAccessed -End (Get-Date)).Days
+            Write-Log "  Last accessed: $lastAccessed ($daysSinceAccess days ago)" -LogOnly
+        } catch {
+            $lastAccessed = $null
+            $daysSinceAccess = $null
+            Write-Log "  Warning: Could not get last access time for profile $profilePath" -Colour Yellow -LogOnly
+        }
+        
+        # Calculate profile size (only for non-matching profiles that may need attention)
+        $profileSize = $null
+        $profileSizeGB = $null
+        if ($profileType -eq "System" -or $profileType -eq "Unknown") {
+            try {
+                $profileSize = (Get-ChildItem -Path $profilePath -Recurse -Force -ErrorAction SilentlyContinue | 
+                               Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+                $profileSizeGB = [math]::Round($profileSize / 1GB, 2)
+                Write-Log "  Profile size: $profileSizeGB GB" -LogOnly
+            } catch {
+                Write-Log "  Warning: Could not determine size for profile $profilePath" -Colour Yellow -LogOnly
+            }
+        }
+        
+        # Create profile object with account type based on our pattern matching
+        $profileObj = [PSCustomObject]@{
+            Name = $profileName
+            Path = $profilePath
+            SID = $sid
+            Type = $profileType
+            AccountType = if ($profileType -in @("Domain", "Local")) { $profileType } else { "System" }
+            LastAccessed = $lastAccessed
+            DaysSinceAccess = $daysSinceAccess
+            SizeBytes = $profileSize
+            SizeGB = $profileSizeGB
+        }
+        
+        if ($profileType -in @("Domain", "Local")) {
+            $userProfileCount++
+            Write-Log "  Added as user profile: $profileName ($profileType)" -LogOnly
+        }
+        
+        $profiles += $profileObj
+        
+        # Log warnings for non-matching profiles that meet certain criteria
+        # Now properly using BOTH threshold variables
+        if ($profileType -eq "System" -or $profileType -eq "Unknown") {
+            $isOldProfile = ($daysSinceAccess -ge $OldProfileThresholdDays)
+            $isLargeProfile = ($profileSizeGB -ge $SignificantProfileSizeGB)
+            $matchesUserPattern = ($profileName -match ($UserAccountIncludePatterns -join '|'))
+            
+            if ($isOldProfile -or $isLargeProfile -or $matchesUserPattern) {
+                $reasons = @()
+                if ($isOldProfile) { $reasons += "not accessed for $daysSinceAccess days" }
+                if ($isLargeProfile) { $reasons += "large size ($profileSizeGB GB)" }
+                if ($matchesUserPattern) { $reasons += "matches user naming pattern" }
+                
+                Write-Log "  NOTE: Profile $profileName looks interesting: $($reasons -join ', ')" -Colour Yellow -LogOnly
+                $nonMatchingProfiles += $profileObj
+            }
+        }
+    }
+    
+    # Log information about non-matching profiles
+    if ($nonMatchingProfiles.Count -gt 0) {
+        Write-Log "Found $($nonMatchingProfiles.Count) profiles that may need attention:" -Colour Yellow
+        Write-Host "  Found $($nonMatchingProfiles.Count) profiles that may need attention (see log for details)" -ForegroundColor Yellow
+        foreach ($profileObj in $nonMatchingProfiles) {
+            $reasons = @()
+            if ($profileObj.DaysSinceAccess -ge $OldProfileThresholdDays) { 
+                $reasons += "not accessed for $($profileObj.DaysSinceAccess) days" 
+            }
+            if ($profileObj.SizeGB -ge $SignificantProfileSizeGB) { 
+                $reasons += "large size ($($profileObj.SizeGB) GB)" 
+            }
+            if ($profileObj.Name -match ($UserAccountIncludePatterns -join '|')) { 
+                $reasons += "matches user naming pattern" 
+            }
+            
+            Write-Log "  - $($profileObj.Name): Categorized as $($profileObj.Type), $($reasons -join ', ')" -Colour Yellow
+        }
+        Write-Log "These profiles were not cleaned as they don't match user profile patterns." -Colour Yellow
+    }
+    
+    # Filter out system profiles if not requested
+    if (-not $IncludeSystemProfiles) {
+        $profiles = $profiles | Where-Object { $_.AccountType -in @("Domain", "Local") }
+    }
+    
+    Write-Log "Profile analysis complete. Found $profileCount total profiles ($userProfileCount user profiles, $(($profiles | Where-Object { $_.AccountType -eq 'Domain' }).Count) domain, $(($profiles | Where-Object { $_.AccountType -eq 'Local' }).Count) local)" -LogOnly
+    Write-Host "Found $profileCount total profiles ($userProfileCount user profiles)" -ForegroundColor Cyan
+    
+    return $profiles
+}
+
+# --- Retrieves a user object from Active Directory via LDAP ---
+function Get-LdapUser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Username
+    )
+    try {
+        $domainDN = ([ADSI]"LDAP://RootDSE").defaultNamingContext
+        if (-not $domainDN) {
+            Write-Error "LDAP query failed: Could not determine defaultNamingContext (domainDN is null or empty)."
+            return $null
+        }
+        $ldapPath = "LDAP://$domainDN"
+        $searcher = New-Object DirectoryServices.DirectorySearcher([ADSI]$ldapPath)
+        $searcher.Filter = "(&(objectClass=user)(sAMAccountName=$Username))"
+        $searcher.PropertiesToLoad.AddRange(@("distinguishedName","displayName","mail","userAccountControl"))
+        $result = $searcher.FindOne()
+        if ($null -eq $result) {
+            Write-Error "LDAP query failed: No result found for user '$Username'."
+            return $null
+        }
+        if ($null -eq $result.Properties -or $result.Properties.Count -eq 0) {
+            Write-Error "LDAP query failed: No properties returned for user '$Username'."
+            return $null
+        }
+        $user = $result.Properties
+        # Defensive checks for each property
+        return [PSCustomObject]@{
+            DistinguishedName = if ($user.distinguishedname.Count -gt 0) { $user.distinguishedname[0] } else { $null }
+            DisplayName       = if ($user.displayname.Count -gt 0) { $user.displayname[0] } else { $null }
+            Email             = if ($user.mail.Count -gt 0) { $user.mail[0] } else { $null }
+            UserAccountControl= if ($user.useraccountcontrol.Count -gt 0) { $user.useraccountcontrol[0] } else { $null }
+        }
+    } catch {
+        Write-Error "LDAP query failed for user '$Username': $_"
+        return $null
+    }
+}
+
+# --- Retrieves the local machine SID prefix ---
+function Get-LocalMachineSIDPrefix {
+    # Returns the SID prefix for local accounts (e.g., S-1-5-21-xxxx-xxxx-xxxx)
+    $computerSID = (Get-WmiObject Win32_UserAccount -Filter "LocalAccount=True" | Select-Object -First 1).SID
+    if ($computerSID) {
+        # Remove the last part (RID) to get the prefix
+        return ($computerSID -replace '\-\d+$','')
+    }
+    return $null
+}
+
+# --- User Profile SID Mapping with CIM/WMI/Hardcoded fallback ---
+function Get-ProfileSIDMap {
+    $map = @{}
+    $folders = Get-ChildItem $UserProfileRoot -Directory
+    Write-Log "Found $($folders.Count) profile folders in $UserProfileRoot" -LogOnly
+    
+    # Try CIM first
+    try {
+        Write-Log "Trying to get profile SIDs using CIM..." -LogOnly
+        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath -like "$UserProfileRoot\*" }
+        Write-Log "Retrieved $($profiles.Count) profiles via CIM" -LogOnly
+        
+        foreach ($profile in $profiles) {
+            $folder = Split-Path $profile.LocalPath -Leaf
+            $map[$folder] = $profile.SID
+            Write-Log "  Mapped $folder to SID $($profile.SID)" -LogOnly
+        }
+    } catch {
+        # Fallback to WMI
+        Write-Log "CIM failed, trying WMI: $_" -Colour Yellow -LogOnly
+        try {
+            Write-Log "Trying to get profile SIDs using WMI..." -LogOnly
+            $profiles = Get-WmiObject Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath -like "$UserProfileRoot\*" }
+            Write-Log "Retrieved $($profiles.Count) profiles via WMI" -LogOnly
+            
+            foreach ($profile in $profiles) {
+                $folder = Split-Path $profile.LocalPath -Leaf
+                $map[$folder] = $profile.SID
+                Write-Log "  Mapped $folder to SID $($profile.SID)" -LogOnly
+            }
+        } catch {
+            Write-Log "WARNING: Falling back to folder names for profile SID mapping. Orphaned profile detection may be less accurate." -Colour Yellow
+            Write-Log "WMI Error: $_" -Colour Yellow -LogOnly
+        }
+    }
+    
+    # Ensure every folder is mapped (even if not in Win32_UserProfile)
+    $unmappedCount = 0
+    foreach ($folder in $folders) {
+        if (-not $map.ContainsKey($folder.Name)) {
+            $map[$folder.Name] = "Unknown-SID"
+            $unmappedCount++
+            Write-Log "  No SID found for folder $($folder.Name), using placeholder" -LogOnly
+        }
+    }
+    if ($unmappedCount -gt 0) {
+        Write-Log "$unmappedCount profile folders had no corresponding SID information" -Colour Yellow -LogOnly
+    }
+    
+    Write-Log "Profile SID mapping complete. Mapped $($map.Count) profiles." -LogOnly
+    return $map
+}
+
+#endregion
+
+#region --- CORE CLEANUP FUNCTIONS ---
 # --- Starts or stops a Windows service and waits for the operation to complete ---
 function Set-ServiceState {
     [CmdletBinding(SupportsShouldProcess)]
@@ -398,10 +756,11 @@ function Set-ServiceState {
         [ValidateSet('Running', 'Stopped')]
         [string]$State,
         [Parameter()]
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [Parameter()]
+        [switch]$AbortOnFailure
     )
     try {
-        # Check if the service exists and is in the desired state
         $service = Get-Service -Name $Name -ErrorAction Stop
         if ($service.Status -eq $State) {
             Write-Log "Service $Name is already $State" -LogOnly
@@ -409,9 +768,7 @@ function Set-ServiceState {
         }
         if ($PSCmdlet.ShouldProcess($Name, "Set service to $State")) {
             Write-Log "Setting service $Name to $State" -LogOnly
-            # Start a timer to wait for the service to change state
             $timer = [System.Diagnostics.Stopwatch]::StartNew()
-            # Start or stop the service based on the desired state
             if ($State -eq 'Running') { $service.Start() } else { $service.Stop() }
             do {
                 Start-Sleep -Milliseconds 500
@@ -423,21 +780,26 @@ function Set-ServiceState {
                 }
             } while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds)
             $timer.Stop()
-            # Log a warning if the service did not reach the desired state within the timeout
             Write-ErrorLog -Operation "Service$State" `
                 -Message "Timeout waiting for service $Name to reach status $State" `
-                -Severity 'Warning'
+                -Severity 'Critical'
+            if ($AbortOnFailure) {
+                throw "Critical: Service $Name did not reach $State in time."
+            }
             return $false
         }
     } catch {
-        # Log the error and return false
         Write-ErrorLog -Operation "Service$State" `
             -Message "Failed to set service $Name to $State" `
             -ErrorRecord $_ `
-            -Severity 'Warning'
+            -Severity 'Critical'
+        if ($AbortOnFailure) {
+            throw "Critical: Service $Name failed to change state."
+        }
         return $false
     }
 }
+
 
 function Remove-Safe {
     [CmdletBinding(SupportsShouldProcess)]
@@ -449,6 +811,7 @@ function Remove-Safe {
     $results = [System.Collections.ArrayList]::new()
     $bytesBefore = 0
     $bytesDeleted = 0
+    $filesDeleted = 0 # Successfully deleted files
 
     # Use Get-ChildItem for wildcards, Get-Item otherwise
     $hasWildcard = $Path.Contains('*')
@@ -466,7 +829,11 @@ function Remove-Safe {
         }
     }
 
+    $totalItems = $items.Count
+    $currentItem = 0
     foreach ($item in $items) {
+        $currentItem++
+        Write-Progress -Activity "Deleting items" -Status "$currentItem of $totalItems" -PercentComplete (($currentItem / $totalItems) * 100)
         if ($item.PSIsContainer) {
             # Directory: get all files and subdirs recursively
             $allFiles = @(Get-ChildItem -Path $item.FullName -File -Recurse -Force -ErrorAction SilentlyContinue)
@@ -479,6 +846,7 @@ function Remove-Safe {
                     try {
                         Remove-Item -Path $file.FullName -Force -ErrorAction Stop
                         $bytesDeleted += $fileSize
+                        $filesDeleted++
                         $null = $results.Add([RemovalResult]::new($file.FullName, $true, $null, $fileSize))
                     } catch {
                         $null = $results.Add([RemovalResult]::new($file.FullName, $false, $_.Exception.Message, $fileSize))
@@ -523,6 +891,7 @@ function Remove-Safe {
                 try {
                     Remove-Item -Path $item.FullName -Force -ErrorAction Stop
                     $bytesDeleted += $fileSize
+                    $filesDeleted++
                     $null = $results.Add([RemovalResult]::new($item.FullName, $true, $null, $fileSize))
                 } catch {
                     $null = $results.Add([RemovalResult]::new($item.FullName, $false, $_.Exception.Message, $fileSize))
@@ -533,15 +902,16 @@ function Remove-Safe {
             }
         }
     }
-
+    Write-Progress -Activity "Deleting items" -Completed
     return [PSCustomObject]@{
         Results = $results
         BytesBefore = $bytesBefore
         BytesDeleted = $bytesDeleted
     }
 }
+#endregion
 
-# --- SPECIAL HANDLERS ---
+#region --- SPECIAL HANDLERS ---
 # --- Archives and cleans IIS log files older than 30 days, moving them to an Archive folder ---
 function Invoke-IISLogsCleanup {
     [CmdletBinding(SupportsShouldProcess)]
@@ -687,7 +1057,7 @@ function Clear-RecycleBin {
             # Use the Clear-RecycleBin cmdlet to empty the Recycle Bin
             Microsoft.PowerShell.Management\Clear-RecycleBin -DriveLetter C -Force -ErrorAction Stop
             Write-Log "Emptied Recycle Bin on C: for all users" -LogOnly
-            # Track the size after emptying 
+            # Track the size after emptyting 
             $binContents = Show-RecycleBinContents
             $sizeAfter = ($binContents | Measure-Object -Property SizeBytes -Sum).Sum
             # Add the step result with size tracking
@@ -696,7 +1066,7 @@ function Clear-RecycleBin {
             # Log the error and add to failure list
             Write-ErrorLog -Operation "RecycleBin" -Message "Could not empty Recycle Bin" -ErrorRecord $_ -Severity 'Warning'
             $binContents = Show-RecycleBinContents
-            # Track the size after emptying (even if it failed)
+            # Track the size after emptyting (even if it failed)
             $sizeAfter = ($binContents | Measure-Object -Property SizeBytes -Sum).Sum
             # Add the step result with size tracking
             Add-StepResult -StepName "Recycle Bin" -BytesBefore $sizeBefore -BytesDeleted ($sizeBefore - $sizeAfter)
@@ -743,7 +1113,178 @@ function Clear-ShadowCopies {
     }
 }
 
-# --- SUMMARY AND REPORTING FUNCTIONS ---
+# --- Cleans up orphaned user profiles by checking if they still exist in Active Directory ---
+function Clear-OrphanedProfiles {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    
+    Write-Log "-- STARTING: Orphaned user profile cleanup --"
+    Write-Host "`nChecking for orphaned domain user profiles..." -ForegroundColor Cyan
+    
+    $domainNetbios = $null
+    try {
+        $ntDomain = Get-WmiObject Win32_NTDomain | Where-Object { $_.DnsForestName } | Select-Object -First 1
+        if ($ntDomain) {
+            $domainNetbios = $ntDomain.DomainName
+            Write-Log "Domain NetBIOS name: $domainNetbios" -LogOnly
+        } else {
+            Write-Log "Could not determine domain NetBIOS name" -Colour Yellow -LogOnly
+        }
+    } catch {
+        Write-Log "Error getting domain information: $_" -Colour Yellow -LogOnly
+    }
+    
+    $orphaned = @()
+    $statusList = @()
+
+    # Use the centralized user profile list
+    $profiles = $Global:UserProfiles | Where-Object { $_.AccountType -eq 'Domain' }
+    
+    Write-Log "Checking $($profiles.Count) domain user profiles for orphaned accounts..."
+    Write-Host "Found $($profiles.Count) domain user profiles to check against Active Directory"
+
+    $checkCount = 0
+    foreach ($userProfile in $profiles) {
+        $checkCount++
+        # Progress indicator
+        if ($checkCount % 5 -eq 0 -or $checkCount -eq $profiles.Count) {
+            Write-Host "  Checked $checkCount of $($profiles.Count) profiles..." -ForegroundColor DarkGray
+        }
+        
+        # Extract username if folder ends with .DOMAIN
+        $adUser = $userProfile.Name
+        if ($domainNetbios -and $userProfile.Name -like "*.$domainNetbios") {
+            $adUser = $userProfile.Name.Substring(0, $userProfile.Name.Length - $domainNetbios.Length - 1)
+            Write-Log "Processing profile: $($userProfile.Name) (AD username: $adUser)" -LogOnly
+        } else {
+            Write-Log "Processing profile: $adUser" -LogOnly
+        }
+        
+        Write-Log "  Checking AD for user: $adUser" -LogOnly
+        $userObj = Get-LdapUser -Username $adUser
+        
+        # Suppress error output from LDAP queries to console
+        $ErrorActionPreference_Original = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        $userObj = Get-LdapUser -Username $adUser 2>$null
+        $ErrorActionPreference = $ErrorActionPreference_Original
+
+        if (-not $userObj) {
+            $status = "Not found in AD"
+            $orphaned += $userProfile
+            Write-Log "  Result: Not found in Active Directory" -LogOnly
+        } elseif (($userObj.UserAccountControl -band 2) -ne 0) {
+            $status = "Disabled in AD"
+            $orphaned += $userProfile
+            Write-Log "  Result: Account is disabled in Active Directory" -LogOnly
+        } else {
+            $status = "Active in AD"
+            Write-Log "  Result: Active account in Active Directory" -LogOnly
+        }
+        $statusList += [PSCustomObject]@{
+            Profile = $userProfile.Name
+            Path    = $userProfile.Path
+            Status  = $status
+        }
+    }
+
+    # Output status list
+    Write-Log "User profile status before deletion:"
+    Write-Host "`nUser profile status summary:" -ForegroundColor Cyan
+    $statusList | ForEach-Object {
+        $colorCode = switch ($_.Status) {
+            "Not found in AD" { "Red" }
+            "Disabled in AD" { "Yellow" }
+            "Active in AD" { "Green" }
+            default { "White" }
+        }
+        
+        $msg = "{0,-20} {1,-40} {2}" -f $_.Profile, $_.Path, $_.Status
+        Write-Log $msg
+        
+        # In console, use colors based on status
+        Write-Host $_.Profile.PadRight(20) -NoNewline
+        Write-Host $_.Path.PadRight(40) -NoNewline
+        Write-Host $_.Status -ForegroundColor $colorCode
+    }
+
+    if ($orphaned.Count -eq 0) {
+        Write-Log "No orphaned profiles found for deletion."
+        Write-Host "`nNo orphaned profiles found for deletion." -ForegroundColor Green
+        Add-StepResult -StepName "OrphanedProfiles" -BytesBefore 0 -BytesDeleted 0
+        Write-Log "-- FINISHED: Orphaned user profile cleanup --"
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Found $($orphaned.Count) orphaned profiles to delete." -ForegroundColor Yellow
+    Write-Host "Press Enter to proceed with deleting orphaned profiles, or Ctrl+C to abort..." -ForegroundColor Yellow
+    if ($host.Name -ne 'Windows PowerShell ISE Host') {
+        [void][System.Console]::ReadLine()
+    } else {
+        Write-Host "(ISE detected: waiting 10 seconds instead of keypress...)" -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
+    }
+
+    # Proceed with deletion
+    $bytesBefore = 0
+    $bytesDeleted = 0
+    $failedDeletions = @()
+    
+    Write-Host "`nDeleting orphaned profiles..." -ForegroundColor Cyan
+    $deleteCount = 0
+    foreach ($userProfile in $orphaned) {
+        $deleteCount++
+        Write-Host "  Deleting profile $deleteCount of $($orphaned.Count): $($userProfile.Name)..." -ForegroundColor Yellow
+        
+        # Get size before deletion
+        Write-Log "Calculating size of profile $($userProfile.Path) before deletion..." -LogOnly
+        $profileSize = 0
+        try {
+            $profileSize = (Get-ChildItem -Path $userProfile.Path -Recurse -Force -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+            Write-Log "Profile size: $([math]::Round($profileSize / 1MB, 2)) MB" -LogOnly
+        } catch {
+            Write-Log "Could not determine size of profile $($userProfile.Path): $_" -LogOnly
+        }
+        
+        $bytesBefore += $profileSize
+        
+        Write-Log "Deleting profile: $($userProfile.Path)" -LogOnly
+        $result = Remove-Safe -Path $userProfile.Path
+        $bytesDeleted += $result.BytesDeleted
+        
+        foreach ($r in $result.Results) {
+            if (-not $r.Success) {
+                $failedDeletions += $r.Path
+            }
+        }
+        
+        if ($result.BytesDeleted -gt 0) {
+            Write-Host "    Deleted $([math]::Round($result.BytesDeleted / 1MB, 2)) MB" -ForegroundColor Green
+        } else {
+            Write-Host "    No data deleted" -ForegroundColor DarkGray
+        }
+    }
+    Add-StepResult -StepName "OrphanedProfiles" -BytesBefore $bytesBefore -BytesDeleted $bytesDeleted
+    
+    Write-Host "`nOrphaned profile cleanup complete" -ForegroundColor Cyan
+    Write-Host "  Total space reclaimed: $([math]::Round($bytesDeleted / 1MB, 2)) MB" -ForegroundColor Green
+    
+    if ($failedDeletions.Count -gt 0) {
+        Write-Log "Failed to delete the following orphaned profiles:" -Colour Yellow -LogOnly
+        Write-Host "`nWARNING: Failed to delete some items:" -ForegroundColor Yellow
+        $failedDeletions | ForEach-Object { 
+            Write-Log " - $_" -LogOnly
+            Write-Host "  - $_" -ForegroundColor Yellow
+        }
+    }
+    Write-Log "-- FINISHED: Orphaned user profile cleanup --"
+}
+
+#endregion
+
+#region --- SUMMARY AND REPORTING FUNCTIONS ---
 # --- Returns the free space on C: in GB, or "Unknown" if it can't be determined ---
 function Get-FreeSpaceGB {
     param()
@@ -760,6 +1301,35 @@ function Get-FreeSpaceGB {
 }
 
 # --- Outputs a summary of the clean-up, including space saved and any failures ---
+
+function Write-SummaryTable {
+    param(
+        [hashtable]$StepSizes,
+        [bool]$IsWhatIf
+    )
+    $totalBefore = 0
+    $totalDeleted = 0
+    $totalAfter = 0
+    foreach ($step in $StepSizes.Keys) {
+        $before = $StepSizes[$step].Before | Convert-Size -To GB
+        $deleted = $StepSizes[$step].Deleted | Convert-Size -To GB
+        $after = $before - $deleted
+        $totalBefore += $before
+        $totalDeleted += $deleted
+        $totalAfter += $after
+        If ($IsWhatIf) {
+            Write-Log ("{0,-30} {1,17:N3}" -f $step, $before)
+        } else {
+            Write-Log ("{0,-20} {1,12:N3} {2,14:N3} {3,12:N3}" -f $step, $before, $deleted, $after)
+        }
+    }
+    return @{
+        TotalBefore = $totalBefore
+        TotalDeleted = $totalDeleted
+        TotalAfter = $totalAfter
+    }
+}
+
 function Show-Summary {
     param(
         [Parameter(Mandatory = $true)]
@@ -771,7 +1341,9 @@ function Show-Summary {
         [Parameter(Mandatory = $true)]
         [datetime]$scriptStartTime,
         [Parameter(Mandatory = $true)]
-        [datetime]$scriptEndTime
+        [datetime]$scriptEndTime,
+        [Parameter(Mandatory = $false)]
+        [bool]$IsWhatIf = $WhatIfPreference  # Use $WhatIfPreference as default
     )
     # Ensure free space values are valid and numeric
     if ($freeBefore -eq "Unknown" -or $freeBefore -isnot [double]) {
@@ -795,24 +1367,11 @@ function Show-Summary {
         Write-Log ("{0,-20} {1,12} {2,14} {3,12}" -f "Action", "Before (GB)", "Deleted (GB)", "Now (GB)")
     }
 
-    $totalBefore = 0
-    $totalDeleted = 0
-    $totalAfter = 0
-    # Get the free space before clean-up, the free space after clean-up, and the total size of files deleted
-    foreach ($step in $script:StepSizes.Keys) {
-        $before = $script:StepSizes[$step].Before | Convert-Size -To GB
-        $deleted = $script:StepSizes[$step].Deleted | Convert-Size -To GB
-        $after = $before - $deleted
-        $totalBefore += $before
-        $totalDeleted += $deleted
-        $totalAfter += $after
-        # Log the step results into summary table
-        If ($IsWhatIf) {
-            Write-Log ("{0,-30} {1,17:N3}" -f $step, $before)
-        } else {
-            Write-Log ("{0,-20} {1,12:N3} {2,14:N3} {3,12:N3}" -f $step, $before, $deleted, $after)
-        }
-    }
+    $summaryTotals = Write-SummaryTable -StepSizes $script:StepSizes -IsWhatIf $IsWhatIf
+    $totalBefore = $summaryTotals.TotalBefore
+    $totalDeleted = $summaryTotals.TotalDeleted
+    $totalAfter = $summaryTotals.TotalAfter
+
     Write-Log ""
     # Log the total sizes
     If ($IsWhatIf) {
@@ -855,8 +1414,9 @@ function Show-Summary {
     Write-Log "Log file saved to: $LogFile"
     Write-Log "==============================================================="
 }
+#endregion
 
-# --- STEP DISPATCHER ---
+#region --- STEP DISPATCHER ---
 # --- Runs the clean-up for a given step, including service handling and logging ---
 function Invoke-Cleanup {
     param(
@@ -881,7 +1441,7 @@ function Invoke-Cleanup {
             return
         }
         # Get paths to clean (static or dynamic)
-        $paths = if ($config.DynamicPaths) { & $config.DynamicPaths } else { $config.Paths }
+        $paths = if ($config.DynamicPaths) { & $config.DynamicPaths $config } else { $config.Paths }
         $beforeTotal = 0
         $deletedTotal = 0
         foreach ($path in $paths) {
@@ -899,113 +1459,107 @@ function Invoke-Cleanup {
             $beforeTotal += $output.BytesBefore
             $deletedTotal += $output.BytesDeleted
         }
-        Add-StepResult -StepName $StepName -BytesBefore $beforeTotal -BytesDeleted $deletedTotal
-        # Restart service if it was running before
-        if ($config.ServiceName -and $wasRunning) {
-            Set-ServiceState -Name $config.ServiceName -State 'Running'
+        # If not WhatIf, report the total bytes before and deleted for this step
+        if (-not $WhatIfPreference) {
+            Add-StepResult -StepName $StepName -BytesBefore $beforeTotal -BytesDeleted $deletedTotal
         }
     } catch {
-        Write-ErrorLog -Operation $StepName -Message "Failed to complete cleanup" -ErrorRecord $_
+        Write-ErrorLog -Operation "Cleanup$StepName" `
+            -Message "Failed to perform cleanup for $StepName" `
+            -ErrorRecord $_ `
+            -Severity 'Critical'
+    } finally {
+        # Ensure service is restarted if it was running before
+        if ($wasRunning) {
+            Set-ServiceState -Name $config.ServiceName -State 'Running' -AbortOnFailure:$false | Out-Null
+        }
+        Write-Log "-- FINISHED: $($config.Description) --"
     }
-    Write-Log "-- FINISHED: $($config.Description) --"
 }
 
-# --- MAIN EXECUTION BLOCK ---
-try {
-    $freeBefore = Get-FreeSpaceGB
-    $IsWhatIf = $PSCmdlet.MyInvocation.BoundParameters['WhatIf']
-    # --- Plan Output Section ---
-    Write-Log "`nCleanup Plan $(if ($IsWhatIf) {'[WhatIf Mode]'} else {'[Execute Mode]'})"
-    Write-Log "========================="
+#endregion
+#region --- EXECUTION START ---
+Write-Log "SafeCleanupCDrive started." -LogOnly
+Write-Host "SafeCleanupCDrive started. Version: 1.3.1" -ForegroundColor Green
 
-    # Enabled steps
-    foreach ($step in $CleanupConfig.Keys) {
-        try {
-            $switchName = "Cleanup$step"
-            $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
-            $desc = $CleanupConfig[$step].Description
-            $mode = if ($IsWhatIf) {'[Will simulate]'} else {'[Will execute]'}
-            if ($enabled) {
-                Write-Log ("• {0} {1}" -f $desc, $mode) -LogOnly
-                Write-Host ("- {0} {1}" -f $desc, $mode)
-            }
-        } catch {
-            $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
-            Write-Log "Error determining enabled state for step '$step': $msg"
-            Write-ErrorLog -Operation "PlanOutput" -Message $msg -ErrorRecord $_
-        }
-    }
-
-    # Skipped steps
-    Write-Log ""
-    Write-Log "Skipped:" -Colour Yellow
-    foreach ($step in $CleanupConfig.Keys) {
-        try {
-            $switchName = "Cleanup$step"
-            $enabled = Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue
-            $desc = $CleanupConfig[$step].Description
-            if (-not $enabled) {
-                Write-Log ("• {0}" -f $desc) -LogOnly
-                Write-Host ("- {0}" -f $desc) -ForegroundColor Yellow
-            }
-        } catch {
-            $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
-            Write-Log "Error determining skipped state for step '$step': $msg"
-            Write-ErrorLog -Operation "PlanOutputSkipped" -Message $msg -ErrorRecord $_
-        }
-    }
-    Write-Log ""
-    Write-Log "`nMode: $(if ($IsWhatIf) {'Simulation (no files will be deleted)'} else {'Live Execution (files will be deleted)'})"
-    Write-Log "Output will be logged to: $LogFile`n"
-    Write-Host ""
-    $timeout = 30
-    Write-Host ("The selected {0} actions will begin in {1} seconds" -f ($(if ($IsWhatIf) {'simulated'} else {'clean-up'}), $timeout)) -ForegroundColor Yellow
-    Write-Host "Press Enter to continue immediately, or Ctrl+C to abort..." -ForegroundColor Yellow
-    
-    # Wait for user input or timeout. Stopwatch object to track elapsed time.
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    # Loop until timeout or user input
-    while ($sw.Elapsed.TotalSeconds -lt $timeout) {
-        $remaining = [math]::Ceiling($timeout - $sw.Elapsed.TotalSeconds)
-        # Updates same line in console with updated countdown
-        Write-Host ("Continuing in {0} seconds..." -f $remaining) -NoNewline
-        Start-Sleep -Seconds 1
-        if ([System.Console]::KeyAvailable) {
-            $null = [System.Console]::ReadLine()
-            break
-        }
-        Write-Host "`r" -NoNewline
-    }
-    $sw.Stop()
-    Write-Host ""
-    Write-Log ("========== {0} Safe clean-up of C: drive started: {1} ==========" -f ($(if ($IsWhatIf) {'[WhatIf]'} else {''}), (Get-Date)))
-    Write-Log ""
-    Start-Sleep 5
-    # --- Execute each cleanup step with nested try/catch ---
-    foreach ($step in $CleanupConfig.Keys) {
-        $switchName = "Cleanup$step"
-        if (Get-Variable -Name $switchName -ValueOnly -ErrorAction SilentlyContinue) {
-            try {
-                Invoke-Cleanup -StepName $step
-            } catch {
-                $msg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
-                Write-Log "Error in step '$step': $msg"
-                #Write-ErrorLog -Operation $step -Message $msg -ErrorRecord $_
-            }
-        }
-    }
-    $freeAfter = Get-FreeSpaceGB
-    # --- Final Summary Section ---
-    Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile `
-        -ScriptStartTime $scriptStartTime -ScriptEndTime (Get-Date)
-} catch {
-    Write-Log "Unexpected script error: $_"
-    Write-Host "A fatal error occurred. See log for details."
-    $msg = if ($_.Exception.Message) { $_.Exception.Message } else { "Unknown error" }
-    Write-ErrorLog -Operation "SomeOperation" -Message $msg -ErrorRecord $_
-    $scriptEndTime = Get-Date
-    $freeAfter = Get-FreeSpaceGB
-    Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile `
-        -ScriptStartTime $scriptStartTime -ScriptEndTime $scriptEndTime
-    exit 3
+# --- INITIAL CLEANUP CHECKS ---
+# Check if running as Administrator
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
+    Write-Host "Configure the scheduled task to run with Administrator privileges." -ForegroundColor Yellow
+    Write-Log "ERROR: Script attempted to run without Administrator privileges. Exiting."
+    exit 1
 }
+
+# --- Log initial parameters
+Write-Log "Initial parameters:" -LogOnly
+foreach ($param in $PSBoundParameters.Keys) {
+    $value = $PSBoundParameters[$param]
+    Write-Log ("  {0} = {1}" -f $param, $value) -LogOnly
+}
+
+# --- Check and create log file
+if ($LogFilePath) {
+    # Check if the provided path is a directory or a file
+    if (Test-Path $LogFilePath -PathType Container) {
+        # If it's a directory, create a log file with the current date and time
+        $LogFile = Join-Path $LogFilePath "SafeCleanupCDrive_$startDateTime.log"
+    } else {
+        # If it's a file, use it directly
+        $LogFile = $LogFilePath
+    }
+} else {
+    # Default log file path if not specified
+    $LogFile = Join-Path $scriptDir "SafeCleanupCDrive_$startDateTime.log"
+}
+# Ensure the log file directory exists
+$parentDir = Split-Path $LogFile -Parent
+if (-not (Test-Path $parentDir)) {
+    # Create the parent directory if it doesn't exist
+    New-Item -ItemType Directory -Path $parentDir -Force -WhatIf:$false | Out-Null
+}
+# Write initial log entry with start time
+Set-Content -Path $LogFile -Value "SafeCleanupCDrive started: $(Get-Date)`n" -WhatIf:$false
+
+# --- MAIN CLEANUP LOGIC ---
+# Perform the cleanup for each requested step
+$steps = @(
+    'WindowsTemp',
+    'CTemp',
+    'UserTemp',
+    'WindowsUpdate',
+    'IvantiPatchCache',
+    'FontCache',
+    'RecycleBin',
+    'ShadowCopies',
+    'WindowsPrefetch',
+    'RecentFiles',
+    'WindowsPatchCache',
+    'IISLogs',
+    'OrphanedProfiles'
+)
+
+foreach ($step in $steps) {
+    # Check if this step is enabled
+    if ($PSBoundParameters["Cleanup$step"]) {
+        Invoke-Cleanup -StepName $step
+    } else {
+        Write-Log "Skipping cleanup for $step (not enabled)" -LogOnly
+    }
+}
+
+# --- FINAL REPORTING ---
+$freeBefore = Get-FreeSpaceGB
+$freeAfter = Get-FreeSpaceGB
+
+# Write final summary
+Show-Summary -freeBefore $freeBefore -freeAfter $freeAfter -LogFile $LogFile -scriptStartTime $scriptStartTime -scriptEndTime (Get-Date)
+
+Write-Log "SafeCleanupCDrive completed." -LogOnly
+Write-Host "SafeCleanupCDrive completed. Log file: $LogFile" -ForegroundColor Green
+
+#endregion
+
+# --- END OF SCRIPT ---
